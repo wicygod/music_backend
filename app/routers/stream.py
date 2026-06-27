@@ -4,9 +4,14 @@ from urllib.parse import quote, urljoin
 
 import httpx
 import yt_dlp
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models.track import Track
+from app.repositories.tracks import get_track
 
 
 router = APIRouter(prefix="/api", tags=["stream"])
@@ -19,6 +24,7 @@ UPSTREAM_HEADERS = {
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "*/*",
 }
+SEARCH_PROVIDERS = ("scsearch5", "ytsearch5")
 CORS_HEADERS = {
     "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": "*",
@@ -68,6 +74,91 @@ def _extract_stream_url(source_url: str) -> str:
         return stream_url
 
     raise HTTPException(status_code=404, detail="Playable audio stream not found")
+
+
+def _track_artist_names(track: Track) -> list[str]:
+    links = sorted(track.artist_links, key=lambda link: 0 if link.role == "main" else 1)
+    return [link.artist.name for link in links if link.artist and link.artist.name]
+
+
+def _track_query(track: Track) -> str:
+    artists = _track_artist_names(track)
+    if artists:
+        return f"{artists[0]} {track.title}".strip()
+    return track.title.strip()
+
+
+def _score_search_entry(query: str, entry: dict) -> int:
+    haystack = " ".join(
+        str(entry.get(key) or "")
+        for key in ("title", "uploader", "artist", "channel", "description", "webpage_url", "url")
+    ).lower()
+    tokens = [token for token in re.split(r"\W+", query.lower()) if len(token) > 1]
+    return sum(1 for token in tokens if token in haystack)
+
+
+def _search_playable_source(query: str) -> tuple[str, str]:
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": False,
+        "skip_download": True,
+        "noplaylist": True,
+        "ignoreerrors": True,
+    }
+    errors: list[str] = []
+    for provider in SEARCH_PROVIDERS:
+        search_query = f"{provider}:{query}"
+        _log(f"[STREAM SEARCH] Searching {provider}: {query}")
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                info = ydl.extract_info(search_query, download=False)
+        except Exception as exc:
+            errors.append(f"{provider}: {exc}")
+            _log(f"[STREAM SEARCH ERROR] {provider} failed for {query}: {exc}")
+            continue
+
+        entries = [entry for entry in (info or {}).get("entries") or [] if isinstance(entry, dict)]
+        playable = [entry for entry in entries if entry.get("webpage_url") or entry.get("original_url") or entry.get("url")]
+        if not playable:
+            continue
+
+        selected = max(playable, key=lambda entry: _score_search_entry(query, entry))
+        source_url = selected.get("webpage_url") or selected.get("original_url") or selected.get("url")
+        if source_url:
+            title = selected.get("title") or "unknown"
+            _log(f"[STREAM SEARCH] Selected {provider}: {title} -> {source_url}")
+            return str(source_url), provider.split("search", 1)[0]
+
+    detail = "; ".join(errors) if errors else "No playable search result"
+    raise HTTPException(status_code=404, detail=f"Playable source not found: {detail}")
+
+
+def _is_known_stream_source(source_url: str | None) -> bool:
+    if not source_url:
+        return False
+    source = source_url.lower()
+    return "soundcloud.com" in source or "youtu.be" in source or "youtube.com" in source
+
+
+async def _resolve_track_source(track: Track, db: Session) -> str:
+    if track.audio_src:
+        return track.audio_src
+    if _is_known_stream_source(track.source_url):
+        return str(track.source_url)
+
+    query = _track_query(track)
+    if not query:
+        raise HTTPException(status_code=404, detail="Track has no searchable title")
+
+    source_url, provider = await run_in_threadpool(_search_playable_source, query)
+    track.source_url = source_url
+    track.source_name = provider
+    track.is_playable = True
+    db.add(track)
+    db.commit()
+    _log(f"[STREAM TRACK] Saved playable source for track_id={track.id}: {source_url}")
+    return source_url
 
 
 async def _get_cached_stream_url(source_url: str) -> str:
@@ -191,6 +282,16 @@ def _stream_direct_url(stream_url: str) -> StreamingResponse:
 @router.get("/stream")
 async def stream(url: str = Query(..., min_length=1)) -> StreamingResponse:
     stream_url = await _get_cached_stream_url(url)
+    return _stream_direct_url(stream_url)
+
+
+@router.get("/stream/track/{track_id}")
+async def stream_track(track_id: int, db: Session = Depends(get_db)) -> StreamingResponse:
+    track = get_track(db, track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+    source_url = await _resolve_track_source(track, db)
+    stream_url = await _get_cached_stream_url(source_url)
     return _stream_direct_url(stream_url)
 
 
