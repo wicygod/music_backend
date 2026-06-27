@@ -74,8 +74,6 @@ def filtered_feed_stmt():
     return select(Track).where(
         Track.quality_score >= 60,
         Track.needs_review == False,
-        Track.is_playable == False,
-        Track.audio_src == None,
     )
 
 
