@@ -1,6 +1,6 @@
 import json
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.artist import Artist
@@ -116,6 +116,16 @@ def search_tracks(db: Session, query: str, limit: int = 25) -> list[Track]:
         return []
     pattern = f"%{normalized_query}%"
     title_pattern = f"%{normalize_title(query)}%"
+    token_filters = [
+        or_(
+            Track.normalized_title.like(f"%{token}%"),
+            Artist.normalized_name.like(f"%{token}%"),
+            Track.genre.like(f"%{token}%"),
+        )
+        for token in normalized_query.split()
+        if len(token) > 1
+    ]
+    token_match = and_(*token_filters) if token_filters else False
     stmt = (
         with_artists(select(Track))
         .join(TrackArtist)
@@ -125,6 +135,7 @@ def search_tracks(db: Session, query: str, limit: int = 25) -> list[Track]:
                 Track.normalized_title.like(title_pattern),
                 Artist.normalized_name.like(pattern),
                 Track.genre.like(pattern),
+                token_match,
             )
         )
         .order_by(Track.popularity_score.desc(), Track.created_at.desc())
