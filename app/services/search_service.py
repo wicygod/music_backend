@@ -14,26 +14,31 @@ from app.services.normalization_service import normalize_name
 from app.services.serialization_service import track_to_read
 
 
+SEARCH_RESULT_LIMIT = 50
+MIN_PROVIDER_RESULTS = 30
+
 SEARCH_PROVIDERS = (
     {
         "name": "soundcloud",
-        "search": "scsearch5",
+        "search": "scsearch50",
         "tag": "soundcloud",
         "default_genre": "soundcloud",
         "popularity_score": 75.0,
+        "max_results": 50,
     },
     {
         "name": "youtube",
-        "search": "ytsearch5",
+        "search": "ytsearch30",
         "tag": "youtube",
         "default_genre": "youtube",
         "popularity_score": 65.0,
+        "max_results": 30,
     },
 )
 
 
-def _has_playable_provider_track(results: list) -> bool:
-    return any(
+def _playable_provider_count(results: list) -> int:
+    return sum(
         bool(track.is_playable)
         and _is_known_provider_source(track.source_name, track.source_url)
         for track in results
@@ -59,7 +64,7 @@ def _score_provider_result(query: str, entry: dict) -> int:
     return sum(1 for token in tokens if token in haystack)
 
 
-def _search_provider(query: str, provider: dict) -> dict | None:
+def _search_provider(query: str, provider: dict) -> list[dict]:
     options = {
         "quiet": True,
         "no_warnings": True,
@@ -73,9 +78,16 @@ def _search_provider(query: str, provider: dict) -> dict | None:
 
     entries = [entry for entry in (info or {}).get("entries") or [] if isinstance(entry, dict)]
     playable = [entry for entry in entries if entry.get("webpage_url") or entry.get("url")]
-    if not playable:
-        return None
-    return max(playable, key=lambda entry: _score_provider_result(query, entry))
+    seen = set()
+    unique = []
+    for entry in playable:
+        key = str(entry.get("id") or entry.get("webpage_url") or entry.get("url"))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(entry)
+    unique.sort(key=lambda entry: _score_provider_result(query, entry), reverse=True)
+    return unique[: int(provider["max_results"])]
 
 
 def _entry_artist_name(entry: dict, fallback: str) -> str:
@@ -92,11 +104,7 @@ def _entry_artist_url(entry: dict) -> str | None:
     return entry.get("uploader_url") or entry.get("channel_url") or entry.get("creator_url")
 
 
-def _save_provider_track(db: Session, query: str, provider: dict) -> bool:
-    result = _search_provider(query, provider)
-    if not result:
-        return False
-
+def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) -> bool:
     title = (result.get("title") or query).strip()
     artist_name = _entry_artist_name(result, query)
     source_url = result.get("webpage_url") or result.get("original_url") or result.get("url")
@@ -163,18 +171,31 @@ def _save_provider_track(db: Session, query: str, provider: dict) -> bool:
     return True
 
 
-def _save_external_track(db: Session, query: str) -> None:
-    try:
-        for provider in SEARCH_PROVIDERS:
-            if _save_provider_track(db, query, provider):
-                return
-    except Exception:
-        db.rollback()
+def _save_provider_tracks(db: Session, query: str, provider: dict) -> int:
+    stored = 0
+    for entry in _search_provider(query, provider):
+        try:
+            if _save_provider_entry(db, query, provider, entry):
+                stored += 1
+        except Exception:
+            db.rollback()
+    return stored
+
+
+def _save_external_tracks(db: Session, query: str) -> None:
+    for provider in SEARCH_PROVIDERS:
+        try:
+            stored = _save_provider_tracks(db, query, provider)
+        except Exception:
+            db.rollback()
+            stored = 0
+        if stored:
+            return
 
 
 def search_local_catalog(db: Session, query: str) -> list[TrackRead]:
-    local_results = search_tracks(db, query)
-    if not _has_playable_provider_track(local_results):
-        _save_external_track(db, query)
-        local_results = search_tracks(db, query)
+    local_results = search_tracks(db, query, limit=SEARCH_RESULT_LIMIT)
+    if _playable_provider_count(local_results) < MIN_PROVIDER_RESULTS:
+        _save_external_tracks(db, query)
+        local_results = search_tracks(db, query, limit=SEARCH_RESULT_LIMIT)
     return [track_to_read(track) for track in local_results]

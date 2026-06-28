@@ -110,7 +110,7 @@ def create_track_with_artist(db: Session, payload: TrackSeedCreate, artist: Arti
     return get_track(db, track.id) or track
 
 
-def search_tracks(db: Session, query: str, limit: int = 25) -> list[Track]:
+def search_tracks(db: Session, query: str, limit: int = 50) -> list[Track]:
     normalized_query = normalize_name(query)
     if not normalized_query:
         return []
