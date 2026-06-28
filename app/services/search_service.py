@@ -1,6 +1,11 @@
+import re
+import threading
+
+from fastapi import BackgroundTasks
 import yt_dlp
 from sqlalchemy.orm import Session
 
+from app.database import SessionLocal
 from app.repositories.artists import find_or_create_artist
 from app.repositories.tracks import search_tracks
 from app.repositories.tracks import (
@@ -16,6 +21,19 @@ from app.services.serialization_service import track_to_read
 
 SEARCH_RESULT_LIMIT = 50
 MIN_PROVIDER_RESULTS = 30
+VARIANT_QUOTA = 2
+_hydration_lock = threading.Lock()
+_hydrating_queries: set[str] = set()
+
+VARIANT_PATTERNS = {
+    "slowed": re.compile(r"\bslowed\b|\bslow\s*\+\s*reverb\b|\bslowed\s*\+\s*reverb\b", re.IGNORECASE),
+    "reverb": re.compile(r"\breverb\b", re.IGNORECASE),
+    "speed": re.compile(r"\bspeed\s*up\b|\bspeedup\b|\bsped\s*up\b|\bspedup\b|\bnightcore\b", re.IGNORECASE),
+}
+
+
+def _log(message: str) -> None:
+    print(message, flush=True)
 
 SEARCH_PROVIDERS = (
     {
@@ -45,6 +63,42 @@ def _playable_provider_count(results: list) -> int:
     )
 
 
+def _variant_types(text: str | None) -> tuple[str, ...]:
+    haystack = (text or "").lower()
+    return tuple(name for name, pattern in VARIANT_PATTERNS.items() if pattern.search(haystack))
+
+
+def _variant_counter_from_tracks(results: list) -> dict[str, int]:
+    counter = {name: 0 for name in VARIANT_PATTERNS}
+    for track in results:
+        for variant_type in _variant_types(track.title):
+            counter[variant_type] += 1
+    return counter
+
+
+def _can_take_variant(counter: dict[str, int], variant_types: tuple[str, ...]) -> bool:
+    return not variant_types or all(counter.get(variant_type, 0) < VARIANT_QUOTA for variant_type in variant_types)
+
+
+def _count_variant(counter: dict[str, int], variant_types: tuple[str, ...]) -> None:
+    for variant_type in variant_types:
+        counter[variant_type] = counter.get(variant_type, 0) + 1
+
+
+def _apply_variant_quota(results: list, limit: int = SEARCH_RESULT_LIMIT) -> list:
+    counter = {name: 0 for name in VARIANT_PATTERNS}
+    filtered = []
+    for track in results:
+        variant_types = _variant_types(track.title)
+        if not _can_take_variant(counter, variant_types):
+            continue
+        _count_variant(counter, variant_types)
+        filtered.append(track)
+        if len(filtered) >= limit:
+            break
+    return filtered
+
+
 def _is_known_provider_source(source_name: str | None, source_url: str | None) -> bool:
     source = (source_url or "").lower()
     return (
@@ -72,6 +126,10 @@ def _search_provider(query: str, provider: dict) -> list[dict]:
         "skip_download": True,
         "noplaylist": True,
         "ignoreerrors": True,
+        "socket_timeout": 10,
+        "retries": 1,
+        "fragment_retries": 1,
+        "extractor_retries": 1,
     }
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(f"{provider['search']}:{query}", download=False)
@@ -171,31 +229,78 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
     return True
 
 
-def _save_provider_tracks(db: Session, query: str, provider: dict) -> int:
+def _save_provider_tracks(db: Session, query: str, provider: dict, variant_counter: dict[str, int]) -> int:
     stored = 0
     for entry in _search_provider(query, provider):
+        variant_types = _variant_types(" ".join(str(entry.get(key) or "") for key in ("title", "webpage_url", "url")))
+        if not _can_take_variant(variant_counter, variant_types):
+            continue
         try:
             if _save_provider_entry(db, query, provider, entry):
                 stored += 1
+                _count_variant(variant_counter, variant_types)
         except Exception:
             db.rollback()
     return stored
 
 
-def _save_external_tracks(db: Session, query: str) -> None:
+def _save_external_tracks(db: Session, query: str, existing_results: list | None = None) -> None:
+    variant_counter = _variant_counter_from_tracks(existing_results or [])
     for provider in SEARCH_PROVIDERS:
         try:
-            stored = _save_provider_tracks(db, query, provider)
+            _log(f"[SEARCH HYDRATE] provider={provider['name']} start query={query}")
+            stored = _save_provider_tracks(db, query, provider, variant_counter)
         except Exception:
             db.rollback()
             stored = 0
+        _log(f"[SEARCH HYDRATE] provider={provider['name']} stored={stored} query={query}")
         if stored:
+            hydrated_results = _apply_variant_quota(search_tracks(db, query, limit=SEARCH_RESULT_LIMIT))
+            if _playable_provider_count(hydrated_results) >= SEARCH_RESULT_LIMIT:
+                return
+
+
+def hydrate_search_catalog(query: str) -> None:
+    normalized_query = normalize_name(query)
+    if not normalized_query:
+        return
+    with _hydration_lock:
+        if normalized_query in _hydrating_queries:
             return
+        _hydrating_queries.add(normalized_query)
+
+    try:
+        with SessionLocal() as db:
+            local_results = _apply_variant_quota(search_tracks(db, query, limit=SEARCH_RESULT_LIMIT))
+            if _playable_provider_count(local_results) >= SEARCH_RESULT_LIMIT:
+                return
+            _log(f"[SEARCH HYDRATE] start query={query} local={len(local_results)}")
+            _save_external_tracks(db, query, existing_results=local_results)
+    finally:
+        with _hydration_lock:
+            _hydrating_queries.discard(normalized_query)
 
 
-def search_local_catalog(db: Session, query: str) -> list[TrackRead]:
-    local_results = search_tracks(db, query, limit=SEARCH_RESULT_LIMIT)
-    if _playable_provider_count(local_results) < MIN_PROVIDER_RESULTS:
-        _save_external_tracks(db, query)
-        local_results = search_tracks(db, query, limit=SEARCH_RESULT_LIMIT)
+def _schedule_hydration(query: str, background_tasks: BackgroundTasks | None) -> None:
+    normalized_query = normalize_name(query)
+    if not normalized_query:
+        return
+    with _hydration_lock:
+        if normalized_query in _hydrating_queries:
+            return
+    if background_tasks:
+        background_tasks.add_task(hydrate_search_catalog, query)
+    else:
+        thread = threading.Thread(target=hydrate_search_catalog, args=(query,), daemon=True)
+        thread.start()
+
+
+def search_local_catalog(
+    db: Session,
+    query: str,
+    background_tasks: BackgroundTasks | None = None,
+) -> list[TrackRead]:
+    local_results = _apply_variant_quota(search_tracks(db, query, limit=SEARCH_RESULT_LIMIT))
+    if _playable_provider_count(local_results) < SEARCH_RESULT_LIMIT:
+        _schedule_hydration(query, background_tasks)
     return [track_to_read(track) for track in local_results]

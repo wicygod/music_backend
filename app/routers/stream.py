@@ -1,6 +1,6 @@
-import time
 import re
-from urllib.parse import quote, urljoin
+import time
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
 import httpx
 import yt_dlp
@@ -17,6 +17,8 @@ from app.repositories.tracks import get_track
 router = APIRouter(prefix="/api", tags=["stream"])
 
 STREAM_CACHE_TTL_SECONDS = 15 * 60
+STREAM_CACHE_REFRESH_MARGIN_SECONDS = 60
+HLS_STREAM_CACHE_TTL_SECONDS = 60
 _stream_cache: dict[str, tuple[float, str]] = {}
 HLS_URI_RE = re.compile(r'URI="([^"]+)"')
 UPSTREAM_HEADERS = {
@@ -35,6 +37,30 @@ CORS_HEADERS = {
 
 def _log(message: str) -> None:
     print(message, flush=True)
+
+
+def _is_hls_url(url: str) -> bool:
+    return ".m3u8" in url.lower()
+
+
+def _stream_url_expires_at(stream_url: str) -> float | None:
+    raw_expires = parse_qs(urlparse(stream_url).query).get("expires")
+    if not raw_expires:
+        return None
+    try:
+        return float(raw_expires[0])
+    except (TypeError, ValueError):
+        return None
+
+
+def _cache_ttl_for_stream(stream_url: str) -> float:
+    ttl = float(STREAM_CACHE_TTL_SECONDS)
+    if _is_hls_url(stream_url):
+        ttl = min(ttl, float(HLS_STREAM_CACHE_TTL_SECONDS))
+    expires_at = _stream_url_expires_at(stream_url)
+    if expires_at:
+        ttl = min(ttl, max(0.0, expires_at - time.time() - STREAM_CACHE_REFRESH_MARGIN_SECONDS))
+    return ttl
 
 
 def _extract_stream_url(source_url: str) -> str:
@@ -97,7 +123,12 @@ def _score_search_entry(query: str, entry: dict) -> int:
     return sum(1 for token in tokens if token in haystack)
 
 
-def _search_playable_source(query: str) -> tuple[str, str]:
+def _search_playable_source(
+    query: str,
+    *,
+    skip_providers: set[str] | None = None,
+    skip_urls: set[str] | None = None,
+) -> tuple[str, str]:
     options = {
         "quiet": True,
         "no_warnings": True,
@@ -107,7 +138,11 @@ def _search_playable_source(query: str) -> tuple[str, str]:
         "ignoreerrors": True,
     }
     errors: list[str] = []
+    skip_providers = skip_providers or set()
+    skip_urls = {url.lower() for url in (skip_urls or set())}
     for provider in SEARCH_PROVIDERS:
+        if provider in skip_providers:
+            continue
         search_query = f"{provider}:{query}"
         _log(f"[STREAM SEARCH] Searching {provider}: {query}")
         try:
@@ -119,13 +154,19 @@ def _search_playable_source(query: str) -> tuple[str, str]:
             continue
 
         entries = [entry for entry in (info or {}).get("entries") or [] if isinstance(entry, dict)]
-        playable = [entry for entry in entries if entry.get("webpage_url") or entry.get("original_url") or entry.get("url")]
+        playable = [
+            entry
+            for entry in entries
+            if entry.get("webpage_url") or entry.get("original_url") or entry.get("url")
+        ]
         if not playable:
             continue
 
-        selected = max(playable, key=lambda entry: _score_search_entry(query, entry))
-        source_url = selected.get("webpage_url") or selected.get("original_url") or selected.get("url")
-        if source_url:
+        playable.sort(key=lambda entry: _score_search_entry(query, entry), reverse=True)
+        for selected in playable:
+            source_url = selected.get("webpage_url") or selected.get("original_url") or selected.get("url")
+            if not source_url or str(source_url).lower() in skip_urls:
+                continue
             title = selected.get("title") or "unknown"
             _log(f"[STREAM SEARCH] Selected {provider}: {title} -> {source_url}")
             return str(source_url), provider.split("search", 1)[0]
@@ -141,17 +182,26 @@ def _is_known_stream_source(source_url: str | None) -> bool:
     return "soundcloud.com" in source or "youtu.be" in source or "youtube.com" in source
 
 
-async def _resolve_track_source(track: Track, db: Session) -> str:
+async def _resolve_track_source(
+    track: Track,
+    db: Session,
+    *,
+    force_search: bool = False,
+    skip_providers: set[str] | None = None,
+    skip_urls: set[str] | None = None,
+) -> str:
     if track.audio_src:
         return track.audio_src
-    if _is_known_stream_source(track.source_url):
+    if not force_search and _is_known_stream_source(track.source_url):
         return str(track.source_url)
 
     query = _track_query(track)
     if not query:
         raise HTTPException(status_code=404, detail="Track has no searchable title")
 
-    source_url, provider = await run_in_threadpool(_search_playable_source, query)
+    source_url, provider = await run_in_threadpool(
+        lambda: _search_playable_source(query, skip_providers=skip_providers, skip_urls=skip_urls)
+    )
     track.source_url = source_url
     track.source_name = provider
     track.is_playable = True
@@ -164,7 +214,7 @@ async def _resolve_track_source(track: Track, db: Session) -> str:
 async def _get_cached_stream_url(source_url: str) -> str:
     now = time.monotonic()
     cached = _stream_cache.get(source_url)
-    if cached and now - cached[0] < STREAM_CACHE_TTL_SECONDS:
+    if cached and now - cached[0] < _cache_ttl_for_stream(cached[1]):
         _log(f"[STREAM] Cache hit: {source_url}")
         return cached[1]
 
@@ -184,6 +234,42 @@ async def _get_cached_stream_url(source_url: str) -> str:
         raise HTTPException(status_code=500, detail="Unexpected stream extraction error") from exc
 
     _stream_cache[source_url] = (now, stream_url)
+    return stream_url
+
+
+async def _validate_stream_url(stream_url: str) -> None:
+    headers = dict(UPSTREAM_HEADERS)
+    if not _is_hls_url(stream_url):
+        headers["Range"] = "bytes=0-0"
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20.0, headers=headers) as client:
+            async with client.stream("GET", stream_url) as response:
+                _log(
+                    f"[STREAM CHECK] Upstream status={response.status_code}, "
+                    f"type={response.headers.get('content-type', 'unknown')}"
+                )
+                if response.status_code in {403, 404}:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"Cached stream URL expired or unavailable: HTTP {response.status_code}",
+                    )
+                response.raise_for_status()
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Stream URL check failed: HTTP {exc.response.status_code}",
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Stream URL check failed: {exc}") from exc
+
+
+async def _get_valid_stream_url(source_url: str, *, refresh: bool = False) -> str:
+    if refresh:
+        _stream_cache.pop(source_url, None)
+    stream_url = await _get_cached_stream_url(source_url)
+    await _validate_stream_url(stream_url)
     return stream_url
 
 
@@ -273,10 +359,50 @@ def _media_type_for(stream_url: str) -> str:
 
 def _stream_direct_url(stream_url: str) -> StreamingResponse:
     media_type = _media_type_for(stream_url)
-    _log(f"[STREAM] Serving via local proxy: media_type={media_type}, hls={'.m3u8' in stream_url.lower()}")
-    if ".m3u8" in stream_url.lower():
+    _log(f"[STREAM] Serving via local proxy: media_type={media_type}, hls={_is_hls_url(stream_url)}")
+    if _is_hls_url(stream_url):
         return StreamingResponse(proxy_hls_playlist(stream_url), media_type=media_type, headers=CORS_HEADERS)
     return StreamingResponse(proxy_stream(stream_url), media_type=media_type, headers=CORS_HEADERS)
+
+
+def _is_retryable_stream_error(exc: HTTPException) -> bool:
+    return exc.status_code in {404, 500, 502}
+
+
+async def _refresh_track_source_and_stream(
+    track: Track,
+    db: Session,
+    failed_sources: set[str],
+) -> tuple[str, str]:
+    attempts: list[set[str]] = [set()]
+    if any("soundcloud.com" in source.lower() for source in failed_sources):
+        attempts.append({"scsearch5"})
+
+    last_error: HTTPException | None = None
+    for skip_providers in attempts:
+        try:
+            source_url = await _resolve_track_source(
+                track,
+                db,
+                force_search=True,
+                skip_providers=skip_providers,
+                skip_urls=failed_sources,
+            )
+            stream_url = await _get_valid_stream_url(source_url, refresh=True)
+            return source_url, stream_url
+        except HTTPException as exc:
+            last_error = exc
+            if not _is_retryable_stream_error(exc):
+                raise
+            if track.source_url:
+                failed_sources.add(str(track.source_url))
+                _stream_cache.pop(str(track.source_url), None)
+            _log(
+                f"[STREAM TRACK] Refresh candidate failed for track_id={track.id}; "
+                f"skip_providers={sorted(skip_providers)}; error={exc.detail}"
+            )
+
+    raise last_error or HTTPException(status_code=404, detail="Playable source not found")
 
 
 @router.get("/stream")
@@ -291,7 +417,25 @@ async def stream_track(track_id: int, db: Session = Depends(get_db)) -> Streamin
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
     source_url = await _resolve_track_source(track, db)
-    stream_url = await _get_cached_stream_url(source_url)
+    try:
+        stream_url = await _get_valid_stream_url(source_url)
+    except HTTPException as exc:
+        if not _is_retryable_stream_error(exc):
+            raise
+        _log(
+            f"[STREAM TRACK] Existing stream failed for track_id={track.id}; "
+            f"refreshing stream URL: {source_url} ({exc.detail})"
+        )
+        try:
+            stream_url = await _get_valid_stream_url(source_url, refresh=True)
+        except HTTPException as refresh_exc:
+            if not _is_retryable_stream_error(refresh_exc):
+                raise
+            _log(
+                f"[STREAM TRACK] Source refresh failed for track_id={track.id}; "
+                f"searching replacement source: {source_url} ({refresh_exc.detail})"
+            )
+            source_url, stream_url = await _refresh_track_source_and_stream(track, db, {source_url})
     return _stream_direct_url(stream_url)
 
 
