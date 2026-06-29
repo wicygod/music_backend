@@ -16,6 +16,7 @@ except ImportError:  # pragma: no cover - production dependency is installed on 
 
 _started_at = time.time()
 _events: deque[dict[str, Any]] = deque(maxlen=300)
+_sessions: dict[str, float] = {}
 _lock = threading.Lock()
 
 
@@ -38,6 +39,23 @@ def recent_events(limit: int = 80) -> list[dict[str, Any]]:
         return list(_events)[-limit:]
 
 
+def record_session(user_id: int | str, *, ip: str | None = None) -> None:
+    key = f"user:{user_id}"
+    if ip:
+        key = f"{key}:{ip}"
+    with _lock:
+        _sessions[key] = time.time()
+
+
+def active_sessions_24h() -> int:
+    cutoff = time.time() - 24 * 60 * 60
+    with _lock:
+        stale = [key for key, seen_at in _sessions.items() if seen_at < cutoff]
+        for key in stale:
+            _sessions.pop(key, None)
+        return len(_sessions)
+
+
 def _memory_stats() -> dict[str, float | int]:
     if not psutil:
         return {"percent": 0, "used": 0, "total": 0}
@@ -58,4 +76,5 @@ def system_stats() -> dict[str, Any]:
         "cpu_percent": round(float(cpu_percent), 1),
         "memory": _memory_stats(),
         "events_buffer": len(_events),
+        "active_sessions_24h": active_sessions_24h(),
     }

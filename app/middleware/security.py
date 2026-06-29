@@ -10,7 +10,7 @@ from starlette.requests import Request
 
 from app.config import APP_AUTH_TOKEN, token_matches
 from app.database import SessionLocal
-from app.services.admin_monitor import record_event
+from app.services.admin_monitor import record_event, record_session
 from app.services.auth_service import decode_access_token, is_user_banned
 
 
@@ -68,6 +68,7 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
         with SessionLocal() as db:
             if is_user_banned(db, user_id):
                 return JSONResponse({"detail": "Account is banned"}, status_code=403)
+        record_session(user_id, ip=self._client_ip(request))
         request.state.user_id = user_id
         return None
 

@@ -25,6 +25,7 @@ from app.services.artist_cleanup_service import clean_provider_artist, provider_
 from app.services.normalization_service import normalize_name
 from app.services.serialization_service import track_to_read
 from app.services.proxy_rotator import proxy_rotator
+from app.services.track_filter_service import dedupe_tracks, is_music_track
 
 
 SEARCH_RESULT_LIMIT = 150
@@ -362,6 +363,8 @@ def _apply_variant_quota(results: list, limit: int = SEARCH_RESULT_LIMIT) -> lis
 
 
 def _is_clean_catalog_track(track) -> bool:
+    if not is_music_track(track):
+        return False
     if BAD_VIDEO_TERMS_RE.search(" ".join(str(value or "") for value in (track.title, track.source_url))):
         return False
     if not track.source_url:
@@ -709,6 +712,7 @@ def search_local_catalog(
         candidates,
         limit=safe_limit,
     )
+    local_results = dedupe_tracks(local_results, limit=safe_limit)
     changed = False
     for track in local_results:
         if _canonicalize_catalog_track_source(track):

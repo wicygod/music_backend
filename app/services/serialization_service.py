@@ -1,5 +1,6 @@
 import json
 from typing import Any
+from urllib.parse import quote
 
 from app.models.artist import Artist
 from app.models.import_job import ImportJob
@@ -95,7 +96,7 @@ def track_to_read(track: Track) -> TrackRead:
         title=track.title,
         normalized_title=track.normalized_title,
         duration_seconds=track.duration_seconds,
-        cover_url=track.cover_url,
+        cover_url=track.cover_url or fallback_cover_data_url(track.title, parsed_artist or (artists[0].name if artists else "")),
         genre=track.genre,
         tags=parse_json_list(track.tags_json),
         language=track.language,
@@ -112,6 +113,28 @@ def track_to_read(track: Track) -> TrackRead:
         created_at=track.created_at,
         updated_at=track.updated_at,
     )
+
+
+def fallback_cover_data_url(title: str | None, artist: str | None = None) -> str:
+    text = " ".join(part for part in (artist, title) if part).strip() or "MD"
+    letters = "".join(char for char in text.upper() if char.isalnum())[:2] or "MD"
+    seed = sum(ord(char) for char in text)
+    palettes = [
+        ("101010", "2a2a2a", "f5f5f5"),
+        ("0d0d0f", "312a25", "ffb86b"),
+        ("08090c", "24352f", "8df5b5"),
+        ("0b0b0e", "26233a", "b7a7ff"),
+        ("090909", "3a2424", "ff7a7a"),
+    ]
+    start, end, ink = palettes[seed % len(palettes)]
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#{start}"/><stop offset="1" stop-color="#{end}"/></linearGradient></defs>
+<rect width="512" height="512" rx="68" fill="url(#g)"/>
+<circle cx="398" cy="92" r="76" fill="#ffffff" opacity=".035"/>
+<circle cx="108" cy="404" r="104" fill="#ffffff" opacity=".028"/>
+<text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-family="Inter,Arial,sans-serif" font-size="132" font-weight="800" fill="#{ink}" letter-spacing="2">{letters}</text>
+</svg>"""
+    return "data:image/svg+xml;charset=utf-8," + quote(svg, safe="")
 
 
 def _popular_artist_from_title(title: str | None) -> str | None:
