@@ -4,7 +4,8 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db
-from app.routers import artists, feed, import_jobs, playlists, search, stream, tracks
+from app.middleware.security import LightweightSecurityMiddleware
+from app.routers import admin, artists, feed, history, import_jobs, playlists, search, stream, tracks
 
 
 @asynccontextmanager
@@ -27,8 +28,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(LightweightSecurityMiddleware)
 
+app.include_router(admin.router)
 app.include_router(feed.router)
+app.include_router(history.router)
 app.include_router(search.router)
 app.include_router(stream.router)
 app.include_router(tracks.router)

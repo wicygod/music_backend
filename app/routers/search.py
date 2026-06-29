@@ -13,6 +13,7 @@ router = APIRouter(prefix="/api", tags=["search"])
 def search(
     background_tasks: BackgroundTasks,
     q: str = Query(..., min_length=1),
+    limit: int = Query(150, ge=1, le=150),
     db: Session = Depends(get_db),
 ) -> list[TrackRead]:
-    return search_local_catalog(db, q, background_tasks)
+    return search_local_catalog(db, q, background_tasks, limit=limit)

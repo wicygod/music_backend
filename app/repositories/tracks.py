@@ -121,6 +121,7 @@ def search_tracks(db: Session, query: str, limit: int = 50) -> list[Track]:
             Track.normalized_title.like(f"%{token}%"),
             Artist.normalized_name.like(f"%{token}%"),
             Track.genre.like(f"%{token}%"),
+            Track.tags_json.like(f"%{token}%"),
         )
         for token in normalized_query.split()
         if len(token) > 1
@@ -135,6 +136,7 @@ def search_tracks(db: Session, query: str, limit: int = 50) -> list[Track]:
                 Track.normalized_title.like(title_pattern),
                 Artist.normalized_name.like(pattern),
                 Track.genre.like(pattern),
+                Track.tags_json.like(pattern),
                 token_match,
             )
         )

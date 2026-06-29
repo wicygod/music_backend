@@ -1,10 +1,16 @@
+import asyncio
+import contextlib
+import math
+import random
 import re
+import shutil
 import time
-from urllib.parse import parse_qs, quote, urljoin, urlparse
+from pathlib import Path
+from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
 
 import httpx
 import yt_dlp
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
@@ -12,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models.track import Track
 from app.repositories.tracks import get_track
+from app.services.proxy_rotator import proxy_rotator
 
 
 router = APIRouter(prefix="/api", tags=["stream"])
@@ -19,24 +26,167 @@ router = APIRouter(prefix="/api", tags=["stream"])
 STREAM_CACHE_TTL_SECONDS = 15 * 60
 STREAM_CACHE_REFRESH_MARGIN_SECONDS = 60
 HLS_STREAM_CACHE_TTL_SECONDS = 60
+MP3_BITRATE_KBPS = 192
+MP3_BYTES_PER_SECOND = MP3_BITRATE_KBPS * 1000 // 8
 _stream_cache: dict[str, tuple[float, str]] = {}
 HLS_URI_RE = re.compile(r'URI="([^"]+)"')
+USER_AGENTS = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Version/17.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+)
+COOKIES_FILE = Path("secrets/cookies.txt")
 UPSTREAM_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": USER_AGENTS[0],
     "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
 }
-SEARCH_PROVIDERS = ("scsearch5", "ytsearch5")
+SEARCH_PROVIDERS = (
+    {"name": "soundcloud", "search": "scsearch5:{query}"},
+    {"name": "youtube", "search": "https://music.youtube.com/search?q={query}"},
+)
 CORS_HEADERS = {
     "Cache-Control": "no-store",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, OPTIONS",
     "Access-Control-Allow-Headers": "*",
 }
+MP3_HEADERS = {
+    **CORS_HEADERS,
+    "Accept-Ranges": "bytes",
+    "X-Content-Type-Options": "nosniff",
+}
+BAD_VIDEO_TERMS_RE = re.compile(
+    r"\b("
+    r"reaction|review|tutorial|podcast|interview|vlog|blog|lets\s*play|let'?s\s*play|gameplay|"
+    r"walkthrough|stream|live\s*stream|news|politics|mock(?:s|ed|ing)?|blast(?:s|ed|ing)?|"
+    r"claim(?:s|ed|ing)?|humiliation|hollywood|grammys|ai\s+music\s+video|ai\s+cover|"
+    r"relationship|robbed|bizarre|insecurity|celebrity|scandal|"
+    r"обзор|реакц(?:ия|ии)|прохожд(?:ение|ения)|летсплей|стрим"
+    r")\b",
+    re.IGNORECASE,
+)
+MAX_MUSIC_DURATION_SECONDS = 15 * 60
 
 
 def _log(message: str) -> None:
     print(message, flush=True)
+
+
+def _pick_user_agent() -> str:
+    return random.choice(USER_AGENTS)
+
+
+def _upstream_headers() -> dict[str, str]:
+    headers = dict(UPSTREAM_HEADERS)
+    headers["User-Agent"] = _pick_user_agent()
+    return headers
+
+
+def _yt_dlp_options(**overrides) -> dict:
+    headers = _upstream_headers()
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "ignoreerrors": True,
+        "http_headers": headers,
+    }
+    if COOKIES_FILE.exists() and COOKIES_FILE.stat().st_size > 0:
+        options["cookiefile"] = str(COOKIES_FILE)
+    proxy = proxy_rotator.next_proxy()
+    if proxy:
+        options["proxy"] = proxy
+    options.update(overrides)
+    return options
+
+
+def _source_host(source_url: str | None) -> str:
+    if not source_url:
+        return ""
+    return (urlparse(str(source_url)).hostname or "").lower().removeprefix("www.")
+
+
+def _is_soundcloud_source(source_url: str | None) -> bool:
+    host = _source_host(source_url)
+    return host == "soundcloud.com" or host.endswith(".soundcloud.com")
+
+
+def _youtube_video_id(source_url: str | None) -> str | None:
+    if not source_url:
+        return None
+    parsed = urlparse(str(source_url))
+    host = (parsed.hostname or "").lower().removeprefix("www.")
+    if host in {"youtube.com", "music.youtube.com", "m.youtube.com"}:
+        video_id = (parse_qs(parsed.query).get("v") or [None])[0]
+        return video_id or None
+    if host == "youtu.be":
+        video_id = parsed.path.strip("/").split("/", 1)[0]
+        return video_id or None
+    return None
+
+
+def _canonical_youtube_music_url(source_url: str | None, external_id: str | None = None) -> str | None:
+    video_id = _youtube_video_id(source_url) or (external_id if external_id and not external_id.isdigit() else None)
+    if not video_id:
+        return None
+    return f"https://music.youtube.com/watch?v={video_id}"
+
+
+def _is_youtube_music_source(source_url: str | None) -> bool:
+    return _youtube_video_id(source_url) is not None
+
+
+def _entry_source_url(entry: dict) -> str | None:
+    source_url = entry.get("webpage_url") or entry.get("original_url") or entry.get("url")
+    if _is_youtube_music_source(source_url):
+        return _canonical_youtube_music_url(str(source_url), str(entry.get("id") or ""))
+    if _is_soundcloud_source(source_url):
+        return str(source_url)
+    return None
+
+
+def _entry_is_music_candidate(provider_name: str, entry: dict) -> bool:
+    source_url = _entry_source_url(entry)
+    if not source_url:
+        return False
+
+    duration = int(entry.get("duration") or 0)
+    if duration and duration > MAX_MUSIC_DURATION_SECONDS:
+        return False
+
+    haystack = " ".join(
+        str(entry.get(key) or "")
+        for key in ("title", "uploader", "artist", "channel", "creator", "description", "webpage_url", "url")
+    )
+    if BAD_VIDEO_TERMS_RE.search(haystack):
+        return False
+
+    if provider_name == "soundcloud":
+        return _is_soundcloud_source(source_url)
+
+    if provider_name == "youtube":
+        if not _is_youtube_music_source(source_url):
+            return False
+        categories = " ".join(str(item) for item in (entry.get("categories") or []))
+        channel = str(entry.get("channel") or entry.get("uploader") or "")
+        title = str(entry.get("title") or "")
+        music_markers = (
+            "music" in categories.lower()
+            or "music.youtube.com" in str(entry.get("webpage_url") or entry.get("url") or "").lower()
+            or channel.lower().endswith(" - topic")
+            or "official audio" in title.lower()
+            or "official music video" in title.lower()
+        )
+        return music_markers
+
+    return False
 
 
 def _is_hls_url(url: str) -> bool:
@@ -44,7 +194,11 @@ def _is_hls_url(url: str) -> bool:
 
 
 def _stream_url_expires_at(stream_url: str) -> float | None:
-    raw_expires = parse_qs(urlparse(stream_url).query).get("expires")
+    raw_expires = None
+    for key, value in parse_qs(urlparse(stream_url).query).items():
+        if key.lower() in {"expires", "expire"}:
+            raw_expires = value
+            break
     if not raw_expires:
         return None
     try:
@@ -65,14 +219,7 @@ def _cache_ttl_for_stream(stream_url: str) -> float:
 
 def _extract_stream_url(source_url: str) -> str:
     _log(f"[STREAM] Requested track URL: {source_url}")
-    options = {
-        "format": "bestaudio/best",
-        "ignoreerrors": True,
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "skip_download": True,
-    }
+    options = _yt_dlp_options(format="bestaudio/best")
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(source_url, download=False)
 
@@ -129,57 +276,49 @@ def _search_playable_source(
     skip_providers: set[str] | None = None,
     skip_urls: set[str] | None = None,
 ) -> tuple[str, str]:
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": False,
-        "skip_download": True,
-        "noplaylist": True,
-        "ignoreerrors": True,
-    }
+    options = _yt_dlp_options(extract_flat=True)
     errors: list[str] = []
     skip_providers = skip_providers or set()
     skip_urls = {url.lower() for url in (skip_urls or set())}
     for provider in SEARCH_PROVIDERS:
-        if provider in skip_providers:
+        provider_name = provider["name"]
+        if provider_name in skip_providers:
             continue
-        search_query = f"{provider}:{query}"
-        _log(f"[STREAM SEARCH] Searching {provider}: {query}")
+        search_query = provider["search"].format(query=quote_plus(query))
+        _log(f"[STREAM SEARCH] Searching {provider_name}: {query}")
         try:
             with yt_dlp.YoutubeDL(options) as ydl:
                 info = ydl.extract_info(search_query, download=False)
         except Exception as exc:
-            errors.append(f"{provider}: {exc}")
-            _log(f"[STREAM SEARCH ERROR] {provider} failed for {query}: {exc}")
+            errors.append(f"{provider_name}: {exc}")
+            _log(f"[STREAM SEARCH ERROR] {provider_name} failed for {query}: {exc}")
             continue
 
         entries = [entry for entry in (info or {}).get("entries") or [] if isinstance(entry, dict)]
         playable = [
             entry
             for entry in entries
-            if entry.get("webpage_url") or entry.get("original_url") or entry.get("url")
+            if _entry_is_music_candidate(provider_name, entry)
         ]
         if not playable:
             continue
 
-        playable.sort(key=lambda entry: _score_search_entry(query, entry), reverse=True)
+        if provider_name != "youtube":
+            playable.sort(key=lambda entry: _score_search_entry(query, entry), reverse=True)
         for selected in playable:
-            source_url = selected.get("webpage_url") or selected.get("original_url") or selected.get("url")
+            source_url = _entry_source_url(selected)
             if not source_url or str(source_url).lower() in skip_urls:
                 continue
             title = selected.get("title") or "unknown"
-            _log(f"[STREAM SEARCH] Selected {provider}: {title} -> {source_url}")
-            return str(source_url), provider.split("search", 1)[0]
+            _log(f"[STREAM SEARCH] Selected {provider_name}: {title} -> {source_url}")
+            return str(source_url), provider_name
 
     detail = "; ".join(errors) if errors else "No playable search result"
     raise HTTPException(status_code=404, detail=f"Playable source not found: {detail}")
 
 
 def _is_known_stream_source(source_url: str | None) -> bool:
-    if not source_url:
-        return False
-    source = source_url.lower()
-    return "soundcloud.com" in source or "youtu.be" in source or "youtube.com" in source
+    return _is_soundcloud_source(source_url) or _is_youtube_music_source(source_url)
 
 
 async def _resolve_track_source(
@@ -190,10 +329,10 @@ async def _resolve_track_source(
     skip_providers: set[str] | None = None,
     skip_urls: set[str] | None = None,
 ) -> str:
-    if track.audio_src:
-        return track.audio_src
-    if not force_search and _is_known_stream_source(track.source_url):
-        return str(track.source_url)
+    if not force_search:
+        provider_url = _provider_source_url(track)
+        if provider_url:
+            return provider_url
 
     query = _track_query(track)
     if not query:
@@ -209,6 +348,26 @@ async def _resolve_track_source(
     db.commit()
     _log(f"[STREAM TRACK] Saved playable source for track_id={track.id}: {source_url}")
     return source_url
+
+
+def _provider_source_url(track: Track) -> str | None:
+    source_name = (track.source_name or "").lower()
+    source_url = str(track.source_url or "")
+    external_id = str(track.source_external_id or "").strip()
+
+    if source_name in {"youtube", "youtube_music", "yt"}:
+        if "youtube.com/watch" in source_url or "youtu.be/" in source_url:
+            return _canonical_youtube_music_url(source_url, external_id) or source_url
+        if external_id and not external_id.isdigit():
+            return f"https://music.youtube.com/watch?v={external_id}"
+
+    if source_name in {"soundcloud", "sc"}:
+        if "soundcloud.com" in source_url and "api-v2.soundcloud.com" not in source_url:
+            return source_url
+
+    if _is_known_stream_source(source_url):
+        return source_url
+    return None
 
 
 async def _get_cached_stream_url(source_url: str) -> str:
@@ -238,7 +397,7 @@ async def _get_cached_stream_url(source_url: str) -> str:
 
 
 async def _validate_stream_url(stream_url: str) -> None:
-    headers = dict(UPSTREAM_HEADERS)
+    headers = _upstream_headers()
     if not _is_hls_url(stream_url):
         headers["Range"] = "bytes=0-0"
     try:
@@ -248,7 +407,7 @@ async def _validate_stream_url(stream_url: str) -> None:
                     f"[STREAM CHECK] Upstream status={response.status_code}, "
                     f"type={response.headers.get('content-type', 'unknown')}"
                 )
-                if response.status_code in {403, 404}:
+                if response.status_code in {403, 404, 410}:
                     raise HTTPException(
                         status_code=502,
                         detail=f"Cached stream URL expired or unavailable: HTTP {response.status_code}",
@@ -276,7 +435,7 @@ async def _get_valid_stream_url(source_url: str, *, refresh: bool = False) -> st
 async def proxy_stream(stream_url: str):
     _log(f"[STREAM PROXY] Segment/audio request: {stream_url}")
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=None, headers=UPSTREAM_HEADERS) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=None, headers=_upstream_headers()) as client:
             async with client.stream("GET", stream_url) as response:
                 _log(
                     f"[STREAM PROXY] Upstream status={response.status_code}, "
@@ -299,7 +458,7 @@ async def proxy_stream(stream_url: str):
 
 async def proxy_hls_playlist(stream_url: str):
     _log(f"[STREAM HLS] Playlist request: {stream_url}")
-    async with httpx.AsyncClient(follow_redirects=True, timeout=None, headers=UPSTREAM_HEADERS) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=None, headers=_upstream_headers()) as client:
         response = await client.get(stream_url)
         _log(
             f"[STREAM HLS] Upstream playlist status={response.status_code}, "
@@ -347,22 +506,158 @@ def _rewrite_hls_uri_attributes(line: str, base_url: str) -> tuple[str, int]:
 
 
 def _media_type_for(stream_url: str) -> str:
-    url = stream_url.lower().split("?", 1)[0]
+    parsed = urlparse(stream_url)
+    upstream_mime = (parse_qs(parsed.query).get("mime") or [None])[0]
+    if upstream_mime and (upstream_mime.startswith("audio/") or upstream_mime.startswith("video/")):
+        return upstream_mime
+
+    url = parsed.path.lower()
     if url.endswith(".m3u8"):
         return "application/x-mpegURL"
     if url.endswith(".aac"):
         return "audio/aac"
+    if url.endswith(".webm"):
+        return "audio/webm"
     if url.endswith(".mp4") or url.endswith(".m4a") or url.endswith(".m4s") or url.endswith(".ts"):
         return "video/mp2t" if url.endswith(".ts") else "audio/mp4"
     return "audio/mpeg"
 
 
-def _stream_direct_url(stream_url: str) -> StreamingResponse:
-    media_type = _media_type_for(stream_url)
-    _log(f"[STREAM] Serving via local proxy: media_type={media_type}, hls={_is_hls_url(stream_url)}")
-    if _is_hls_url(stream_url):
-        return StreamingResponse(proxy_hls_playlist(stream_url), media_type=media_type, headers=CORS_HEADERS)
-    return StreamingResponse(proxy_stream(stream_url), media_type=media_type, headers=CORS_HEADERS)
+def _ffmpeg_headers_arg(headers: dict[str, str]) -> str:
+    return "".join(f"{key}: {value}\r\n" for key, value in headers.items())
+
+
+async def _drain_ffmpeg_stderr(process: asyncio.subprocess.Process, stream_url: str) -> None:
+    if not process.stderr:
+        return
+    stderr = await process.stderr.read()
+    if stderr:
+        text = stderr.decode("utf-8", errors="replace").strip()
+        if text:
+            _log(f"[STREAM FFMPEG] stderr for {stream_url}: {text[-2000:]}")
+
+
+def _range_start(range_header: str | None) -> int | None:
+    if not range_header:
+        return None
+    match = re.match(r"bytes=(\d+)-", range_header.strip(), flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return max(0, int(match.group(1)))
+    except ValueError:
+        return None
+
+
+def _seek_context(
+    request: Request,
+    start: float = 0.0,
+    duration_seconds: int | None = None,
+) -> tuple[float, int | None, int | None, int]:
+    range_start = _range_start(request.headers.get("range"))
+    start_seconds = max(0.0, float(start or 0.0))
+    if range_start is not None:
+        start_seconds = max(start_seconds, range_start / MP3_BYTES_PER_SECOND)
+    start_byte = range_start if range_start is not None else int(start_seconds * MP3_BYTES_PER_SECOND)
+    total_bytes = None
+    if duration_seconds and duration_seconds > 0:
+        total_bytes = max(start_byte + 1, math.ceil(duration_seconds * MP3_BYTES_PER_SECOND))
+    status_code = 206 if range_start is not None or start_seconds > 0 else 200
+    return start_seconds, range_start, total_bytes, status_code
+
+
+def _mp3_stream_headers(start_byte: int, total_bytes: int | None, status_code: int) -> dict[str, str]:
+    headers = dict(MP3_HEADERS)
+    if status_code == 206:
+        if total_bytes:
+            end_byte = max(start_byte, total_bytes - 1)
+            headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{total_bytes}"
+        else:
+            headers["Content-Range"] = f"bytes {start_byte}-/*"
+    return headers
+
+
+async def transcode_to_mp3(stream_url: str, start_seconds: float = 0.0):
+    headers = _upstream_headers()
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        _log("[STREAM FFMPEG ERROR] ffmpeg binary not found")
+        raise RuntimeError("ffmpeg binary not found")
+
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-user_agent",
+        headers["User-Agent"],
+        "-headers",
+        _ffmpeg_headers_arg(headers),
+    ]
+    if start_seconds > 0:
+        command.extend(["-ss", f"{start_seconds:.3f}"])
+    command.extend([
+        "-i",
+        stream_url,
+        "-vn",
+        "-f",
+        "mp3",
+        "-codec:a",
+        "libmp3lame",
+        "-b:a",
+        "192k",
+        "-",
+    ])
+    _log(f"[STREAM FFMPEG] Starting MP3 transcode start={start_seconds:.3f}s for {stream_url}")
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stderr_task = asyncio.create_task(_drain_ffmpeg_stderr(process, stream_url))
+    try:
+        if not process.stdout:
+            return
+        while True:
+            chunk = await process.stdout.read(16 * 1024)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        if process.returncode is None:
+            process.terminate()
+            with contextlib.suppress(ProcessLookupError, asyncio.TimeoutError):
+                await asyncio.wait_for(process.wait(), timeout=2.0)
+        if process.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+        with contextlib.suppress(Exception):
+            await stderr_task
+        _log(f"[STREAM FFMPEG] Finished MP3 transcode rc={process.returncode} for {stream_url}")
+
+
+def _stream_direct_url(
+    stream_url: str,
+    request: Request,
+    *,
+    start: float = 0.0,
+    duration_seconds: int | None = None,
+) -> StreamingResponse:
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(status_code=503, detail="ffmpeg is not installed on backend host")
+    start_seconds, range_start, total_bytes, status_code = _seek_context(request, start, duration_seconds)
+    start_byte = range_start if range_start is not None else int(start_seconds * MP3_BYTES_PER_SECOND)
+    _log(
+        f"[STREAM] Serving via ffmpeg MP3 transcode: hls={_is_hls_url(stream_url)} "
+        f"start={start_seconds:.3f}s status={status_code}"
+    )
+    return StreamingResponse(
+        transcode_to_mp3(stream_url, start_seconds=start_seconds),
+        status_code=status_code,
+        media_type="audio/mpeg",
+        headers=_mp3_stream_headers(start_byte, total_bytes, status_code),
+    )
 
 
 def _is_retryable_stream_error(exc: HTTPException) -> bool:
@@ -376,7 +671,7 @@ async def _refresh_track_source_and_stream(
 ) -> tuple[str, str]:
     attempts: list[set[str]] = [set()]
     if any("soundcloud.com" in source.lower() for source in failed_sources):
-        attempts.append({"scsearch5"})
+        attempts.append({"soundcloud"})
 
     last_error: HTTPException | None = None
     for skip_providers in attempts:
@@ -406,13 +701,22 @@ async def _refresh_track_source_and_stream(
 
 
 @router.get("/stream")
-async def stream(url: str = Query(..., min_length=1)) -> StreamingResponse:
-    stream_url = await _get_cached_stream_url(url)
-    return _stream_direct_url(stream_url)
+async def stream(
+    request: Request,
+    url: str = Query(..., min_length=1),
+    start: float = Query(0.0, ge=0),
+) -> StreamingResponse:
+    stream_url = await _get_valid_stream_url(url)
+    return _stream_direct_url(stream_url, request, start=start)
 
 
 @router.get("/stream/track/{track_id}")
-async def stream_track(track_id: int, db: Session = Depends(get_db)) -> StreamingResponse:
+async def stream_track(
+    track_id: int,
+    request: Request,
+    start: float = Query(0.0, ge=0),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
     track = get_track(db, track_id)
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
@@ -436,16 +740,18 @@ async def stream_track(track_id: int, db: Session = Depends(get_db)) -> Streamin
                 f"searching replacement source: {source_url} ({refresh_exc.detail})"
             )
             source_url, stream_url = await _refresh_track_source_and_stream(track, db, {source_url})
-    return _stream_direct_url(stream_url)
+    return _stream_direct_url(stream_url, request, start=start, duration_seconds=track.duration_seconds)
 
 
 @router.get("/stream/proxy")
 async def stream_proxy(
+    request: Request,
     segment_url: str | None = Query(None, min_length=1),
     url: str | None = Query(None, min_length=1),
+    start: float = Query(0.0, ge=0),
 ) -> StreamingResponse:
     stream_url = segment_url or url
     if not stream_url:
         raise HTTPException(status_code=422, detail="segment_url is required")
     _log(f"[STREAM PROXY] Local segment endpoint hit: {stream_url}")
-    return _stream_direct_url(stream_url)
+    return _stream_direct_url(stream_url, request, start=start)

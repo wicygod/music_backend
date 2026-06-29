@@ -41,6 +41,7 @@ def migrate_dev_schema() -> None:
     if "artists" not in inspector.get_table_names():
         return
 
+    table_names = set(inspector.get_table_names())
     columns = {column["name"] for column in inspector.get_columns("artists")}
     artist_columns = {
         "priority": "VARCHAR(32) NOT NULL DEFAULT 'normal'",
@@ -54,3 +55,10 @@ def migrate_dev_schema() -> None:
         for name, definition in artist_columns.items():
             if name not in columns:
                 connection.execute(text(f"ALTER TABLE artists ADD COLUMN {name} {definition}"))
+
+        if "listening_history" in table_names:
+            history_columns = {column["name"] for column in inspector.get_columns("listening_history")}
+            if "user_id" not in history_columns:
+                connection.execute(
+                    text("ALTER TABLE listening_history ADD COLUMN user_id VARCHAR(128) NOT NULL DEFAULT 'local'")
+                )
