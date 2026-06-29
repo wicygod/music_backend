@@ -62,3 +62,17 @@ def migrate_dev_schema() -> None:
                 connection.execute(
                     text("ALTER TABLE listening_history ADD COLUMN user_id VARCHAR(128) NOT NULL DEFAULT 'local'")
                 )
+
+        if "users" in table_names:
+            user_columns = {column["name"] for column in inspector.get_columns("users")}
+            user_column_defs = {
+                "login": "VARCHAR(64)",
+                "nickname": "VARCHAR(96) NOT NULL DEFAULT 'User'",
+                "password_hash": "VARCHAR(256)",
+                "avatar_url": "TEXT",
+                "subscription_status": "VARCHAR(32) NOT NULL DEFAULT 'inactive'",
+                "created_at": "DATETIME",
+            }
+            for name, definition in user_column_defs.items():
+                if name not in user_columns:
+                    connection.execute(text(f"ALTER TABLE users ADD COLUMN {name} {definition}"))

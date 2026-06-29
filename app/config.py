@@ -29,6 +29,11 @@ ADMIN_API_KEY = os.getenv(
     "MUSIC_ADMIN_API_KEY",
     "admin_6b5e5f2d8c8d45d2b74573d0e2b681b0",
 )
+JWT_SECRET = os.getenv(
+    "MUSIC_JWT_SECRET",
+    "jwt_3f84cb1a9f3d4c06bf3f6ff0f4bda7c9e38f4ddce2d341d9b0f722e8e9e1d8a7",
+)
+JWT_EXPIRES_SECONDS = get_int_env("MUSIC_JWT_EXPIRES_SECONDS", 60 * 60 * 24 * 30)
 
 
 def token_matches(expected: str, received: str | None) -> bool:

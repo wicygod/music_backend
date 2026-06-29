@@ -9,13 +9,16 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 
 from app.config import APP_AUTH_TOKEN, token_matches
+from app.database import SessionLocal
 from app.services.admin_monitor import record_event
+from app.services.auth_service import decode_access_token, is_user_banned
 
 
 RATE_LIMIT_WINDOW_SECONDS = 2.0
 RATE_LIMIT_MAX_REQUESTS = 3
 RATE_LIMIT_BLOCK_SECONDS = 120.0
 RATE_LIMIT_PATH_RE = re.compile(r"^/api/(?:search|stream)(?:/|$)")
+AUTH_EXEMPT_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login"}
 
 
 class LightweightSecurityMiddleware(BaseHTTPMiddleware):
@@ -33,6 +36,10 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
             return JSONResponse({"detail": "Unauthorized app token"}, status_code=401)
 
         client_ip = self._client_ip(request)
+        auth_response = self._auth_response(request)
+        if auth_response:
+            return auth_response
+
         if RATE_LIMIT_PATH_RE.match(request.url.path):
             limited_response = self._rate_limit_response(client_ip, request.url.path)
             if limited_response:
@@ -45,6 +52,30 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
         header_token = request.headers.get("X-App-Token")
         query_token = parse_qs(request.url.query).get("app_token", [None])[0]
         return token_matches(APP_AUTH_TOKEN, header_token or query_token)
+
+    def _auth_response(self, request: Request):
+        path = request.url.path
+        if path in AUTH_EXEMPT_PATHS or path.startswith("/api/admin"):
+            return None
+        token = self._auth_token(request)
+        if not token:
+            return JSONResponse({"detail": "Missing auth token"}, status_code=401)
+        try:
+            payload = decode_access_token(token)
+            user_id = int(payload["sub"])
+        except Exception:
+            return JSONResponse({"detail": "Invalid auth token"}, status_code=401)
+        with SessionLocal() as db:
+            if is_user_banned(db, user_id):
+                return JSONResponse({"detail": "Account is banned"}, status_code=403)
+        request.state.user_id = user_id
+        return None
+
+    def _auth_token(self, request: Request) -> str | None:
+        authorization = request.headers.get("Authorization") or ""
+        if authorization.lower().startswith("bearer "):
+            return authorization.split(" ", 1)[1].strip()
+        return parse_qs(request.url.query).get("auth_token", [None])[0]
 
     def _client_ip(self, request: Request) -> str:
         forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-real-ip")
