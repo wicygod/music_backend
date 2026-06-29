@@ -34,6 +34,7 @@ JWT_SECRET = os.getenv(
     "jwt_3f84cb1a9f3d4c06bf3f6ff0f4bda7c9e38f4ddce2d341d9b0f722e8e9e1d8a7",
 )
 JWT_EXPIRES_SECONDS = get_int_env("MUSIC_JWT_EXPIRES_SECONDS", 60 * 60 * 24 * 30)
+BUGREPORT_SERVICE_URL = os.getenv("BUGREPORT_SERVICE_URL", "http://127.0.0.1:8001/api/bugreport")
 
 
 def token_matches(expected: str, received: str | None) -> bool:
