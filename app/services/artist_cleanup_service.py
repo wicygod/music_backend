@@ -4,7 +4,7 @@ from urllib.parse import urlparse
 from app.services.normalization_service import clean_display_artist_name, normalize_name
 
 
-TITLE_ARTIST_SEP_RE = re.compile(r"\s+(?:-|–|—|:)\s+")
+TITLE_ARTIST_SEP_RE = re.compile(r"\s+(?:-|\u2013|\u2014|:)\s+")
 NOISE_ARTIST_RE = re.compile(
     r"\b("
     r"official|audio|video|lyrics?|lyric|visualizer|remix|sped|speed|slowed|reverb|8d|nightcore|"
@@ -19,6 +19,33 @@ SUSPICIOUS_UPLOADER_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+POPULAR_BRACKET_RE = re.compile(
+    r"[\[(][^\])]*(?:sped|speed|slowed|reverb|8d|nightcore|remix|edit|bootleg|mashup|lyrics?|demo|snippet|ai)[^\])]*[\])]",
+    re.IGNORECASE,
+)
+POPULAR_VARIANT_RE = re.compile(
+    r"\b("
+    r"sped\s*up|speed\s*up|speedup|spedup|slowed|slow\s*\+\s*reverb|slowed\s*\+\s*reverb|"
+    r"reverb|8d|nightcore|remix|edit|bootleg|mashup|bass\s*boost(?:ed)?|visualizer|lyrics?|"
+    r"breakcore|cover|\u043a\u0430\u0432\u0435\u0440|snippet|preview|demo|ai|mylancore|instrumental|karaoke"
+    r")\b",
+    re.IGNORECASE,
+)
+POPULAR_TRAILING_VARIANT_RE = re.compile(
+    r"\b("
+    r"sped\s*up|speed\s*up|speedup|spedup|slowed|reverb|8d|nightcore|remix|edit|"
+    r"bootleg|mashup|breakcore|cover|\u043a\u0430\u0432\u0435\u0440|snippet|preview|demo|ai|"
+    r"mylancore|instrumental|karaoke|bass\s*boost(?:ed)?"
+    r")\b.*$",
+    re.IGNORECASE,
+)
+POPULAR_DOMAIN_RE = re.compile(
+    r"\b(?:https?://)?(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)+(?:/[^\s]*)?",
+    re.IGNORECASE,
+)
+POPULAR_FILE_EXT_RE = re.compile(r"\.(?:mp3|m4a|webm|wav|flac|aac|ogg)\b", re.IGNORECASE)
+ARTIST_SPLIT_RE = re.compile(r"\s*(?:,|&|\+|/|\bx\b|\bfeat\.?\b|\bft\.?\b|\bwith\b)\s*", re.IGNORECASE)
+POPULAR_NON_WORD_RE = re.compile(r"[^\w\s]+", re.UNICODE)
 TRUSTED_COMMUNITIES = {
     "gothboiclique",
     "goth boi clique",
@@ -38,9 +65,11 @@ def _looks_like_artist(value: str) -> bool:
         return False
     if any(part in normalized for part in ("www", "http", ".com", ".ru", ".net", ".org")):
         return False
+    if POPULAR_DOMAIN_RE.search(cleaned):
+        return False
     if NOISE_ARTIST_RE.search(normalized):
         return False
-    return bool(re.search(r"[A-Za-zА-Яа-яЁё0-9]", cleaned))
+    return bool(re.search(r"[A-Za-z\u0410-\u042f\u0430-\u044f\u0401\u04510-9]", cleaned))
 
 
 def artist_from_title(title: str | None) -> str | None:
@@ -105,7 +134,7 @@ def provider_authority_score(title: str | None, uploader: str | None, query: str
 
 
 def _compact(value: str) -> str:
-    return re.sub(r"[^a-z0-9а-яё]+", "", normalize_name(value))
+    return re.sub(r"[^a-z0-9\u0430-\u044f\u0451]+", "", normalize_name(value))
 
 
 def source_profile_matches_artist(source_url: str | None, artist: str | None) -> bool:
@@ -126,3 +155,36 @@ def has_clean_artist_signal(title: str | None, artist: str | None, source_url: s
     if source_profile_matches_artist(source_url, artist):
         return True
     return is_trusted_music_uploader(artist)
+
+
+def popular_track_key(title: str | None, artist: str | None = None) -> str:
+    display_artist = primary_artist_segment(artist or artist_from_title(title) or "")
+    display_title = title_without_artist_prefix(title)
+    artist_key = normalize_name(display_artist)
+    raw = _popular_title_core(display_title, artist_key)
+    if not raw and title and display_title != title:
+        raw = _popular_title_core(title, artist_key)
+    return raw
+
+
+def _popular_title_core(value: str | None, artist_key: str = "") -> str:
+    raw = (value or "").lower()
+    raw = POPULAR_DOMAIN_RE.sub(" ", raw)
+    raw = POPULAR_FILE_EXT_RE.sub(" ", raw)
+    raw = POPULAR_BRACKET_RE.sub(" ", raw)
+    raw = POPULAR_TRAILING_VARIANT_RE.sub(" ", raw)
+    raw = POPULAR_VARIANT_RE.sub(" ", raw)
+    raw = re.sub(r"\b(?:prod|produced\s+by)\b.*$", " ", raw, flags=re.IGNORECASE)
+    raw = POPULAR_NON_WORD_RE.sub(" ", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
+    if artist_key:
+        raw = re.sub(rf"\b{re.escape(artist_key)}\b", " ", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s+", " ", raw).strip()
+    return raw
+
+
+def primary_artist_segment(artist: str | None) -> str:
+    if not artist:
+        return ""
+    parts = [part.strip() for part in ARTIST_SPLIT_RE.split(artist) if part.strip()]
+    return clean_display_artist_name(parts[0] if parts else artist)

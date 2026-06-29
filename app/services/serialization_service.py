@@ -13,6 +13,21 @@ from app.services.artist_cleanup_service import artist_from_title
 from app.services.normalization_service import normalize_name
 
 
+POPULAR_DISPLAY_ARTISTS = {
+    "lil peep": "Lil Peep",
+    "9 mice": "9 mice",
+    "kai angel": "Kai Angel",
+    "viperr": "Viperr",
+    "pharaoh": "Pharaoh",
+    "\u0442\u0451\u043c\u043d\u044b\u0439 \u043f\u0440\u0438\u043d\u0446": "\u0422\u0451\u043c\u043d\u044b\u0439 \u041f\u0440\u0438\u043d\u0446",
+    "fortuna812": "fortuna812",
+    "face": "Face",
+    "cupsize": "CUPSIZE",
+    "madkid": "madkid",
+    "\u0441\u043d\u044f\u043b\u0446\u0435\u043f\u0438": "\u0441\u043d\u044f\u043b\u0446\u0435\u043f\u0438",
+}
+
+
 def parse_json_list(raw: str | None) -> list[str]:
     if not raw:
         return []
@@ -72,7 +87,7 @@ def artist_to_read(artist: Artist, track_count: int | None = None) -> ArtistRead
 def track_to_read(track: Track) -> TrackRead:
     main_first = sorted(track.artist_links, key=lambda link: 0 if link.role == "main" else 1)
     artists = [artist_summary(link.artist) for link in main_first]
-    parsed_artist = artist_from_title(track.title)
+    parsed_artist = _popular_artist_from_title(track.title) or artist_from_title(track.title)
     if parsed_artist and artists and normalize_name(artists[0].name) != normalize_name(parsed_artist):
         artists[0] = artists[0].model_copy(update={"name": parsed_artist})
     return TrackRead(
@@ -97,6 +112,14 @@ def track_to_read(track: Track) -> TrackRead:
         created_at=track.created_at,
         updated_at=track.updated_at,
     )
+
+
+def _popular_artist_from_title(title: str | None) -> str | None:
+    normalized = normalize_name(title or "")
+    for key, display_name in POPULAR_DISPLAY_ARTISTS.items():
+        if key and (normalized == key or normalized.startswith(f"{key} ") or f" {key} " in f" {normalized} "):
+            return display_name
+    return None
 
 
 def playlist_to_read(playlist: UserPlaylist) -> PlaylistRead:
