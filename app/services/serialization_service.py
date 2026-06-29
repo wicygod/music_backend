@@ -9,6 +9,8 @@ from app.schemas.artist import ArtistRead, ArtistSummary, ArtistWithTracks
 from app.schemas.import_job import ImportJobRead
 from app.schemas.playlist import FavoriteRead, PlaylistRead
 from app.schemas.track import TrackRead
+from app.services.artist_cleanup_service import artist_from_title
+from app.services.normalization_service import normalize_name
 
 
 def parse_json_list(raw: str | None) -> list[str]:
@@ -69,6 +71,10 @@ def artist_to_read(artist: Artist, track_count: int | None = None) -> ArtistRead
 
 def track_to_read(track: Track) -> TrackRead:
     main_first = sorted(track.artist_links, key=lambda link: 0 if link.role == "main" else 1)
+    artists = [artist_summary(link.artist) for link in main_first]
+    parsed_artist = artist_from_title(track.title)
+    if parsed_artist and artists and normalize_name(artists[0].name) != normalize_name(parsed_artist):
+        artists[0] = artists[0].model_copy(update={"name": parsed_artist})
     return TrackRead(
         id=track.id,
         title=track.title,
@@ -87,7 +93,7 @@ def track_to_read(track: Track) -> TrackRead:
         source_external_id=track.source_external_id,
         source_url=track.source_url,
         needs_review=track.needs_review,
-        artists=[artist_summary(link.artist) for link in main_first],
+        artists=artists,
         created_at=track.created_at,
         updated_at=track.updated_at,
     )

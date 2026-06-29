@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.models.artist import Artist
 from app.models.track import Track, TrackArtist
 from app.schemas.track import TrackSeedCreate
+from app.services.artist_cleanup_service import has_clean_artist_signal
 from app.services.normalization_service import normalize_name, normalize_title, normalize_track_title_for_dedupe
 
 
@@ -157,10 +158,30 @@ def list_random_tracks(db: Session, limit: int = 12) -> list[Track]:
 
 
 def list_trending_tracks(db: Session, limit: int = 12) -> list[Track]:
-    stmt = with_artists(
-        filtered_feed_stmt().order_by(Track.popularity_score.desc(), Track.quality_score.desc()).limit(limit)
+    stmt = (
+        with_artists(filtered_feed_stmt())
+        .join(TrackArtist)
+        .join(Artist)
+        .where(
+            Track.is_playable == True,
+            Track.source_name.in_(["soundcloud", "youtube", "youtube_music", "yt", "sc"]),
+        )
+        .order_by(Track.popularity_score.desc(), Track.quality_score.desc(), Track.created_at.desc())
+        .limit(max(limit * 4, limit))
     )
-    return list(db.execute(stmt).scalars().unique().all())
+    candidates = list(db.execute(stmt).scalars().unique().all())
+    filtered = []
+    for track in candidates:
+        artists = [
+            link.artist.name
+            for link in sorted(track.artist_links, key=lambda item: 0 if item.role == "main" else 1)
+            if link.artist and link.artist.name
+        ]
+        if artists and has_clean_artist_signal(track.title, artists[0], track.source_url):
+            filtered.append(track)
+        if len(filtered) >= limit:
+            break
+    return filtered
 
 
 def list_region_tracks(db: Session, region: str, limit: int = 12) -> list[Track]:

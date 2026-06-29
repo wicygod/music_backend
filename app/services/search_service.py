@@ -21,6 +21,7 @@ from app.repositories.tracks import (
 )
 from app.schemas.track import TrackRead
 from app.schemas.track import TrackSeedCreate
+from app.services.artist_cleanup_service import clean_provider_artist, provider_authority_score, title_without_artist_prefix
 from app.services.normalization_service import normalize_name
 from app.services.serialization_service import track_to_read
 from app.services.proxy_rotator import proxy_rotator
@@ -466,14 +467,26 @@ def _search_provider(query: str, provider: dict, limit: int) -> list[dict]:
         entry["_search_order"] = len(unique)
         unique.append(entry)
     if provider_name == "youtube":
-        unique.sort(key=lambda entry: int(entry.get("_search_order") or 0))
+        unique.sort(
+            key=lambda entry: (
+                provider_authority_score(entry.get("title"), _entry_artist_name(entry, ""), query),
+                -int(entry.get("_search_order") or 0),
+            ),
+            reverse=True,
+        )
     else:
-        unique.sort(key=lambda entry: _score_provider_result(query, entry), reverse=True)
+        unique.sort(
+            key=lambda entry: (
+                provider_authority_score(entry.get("title"), _entry_artist_name(entry, ""), query),
+                _score_provider_result(query, entry),
+            ),
+            reverse=True,
+        )
     return unique[:search_limit]
 
 
 def _entry_artist_name(entry: dict, fallback: str) -> str:
-    return (
+    return str(
         entry.get("uploader")
         or entry.get("artist")
         or entry.get("creator")
@@ -510,8 +523,10 @@ def _ensure_query_tag(track, query: str) -> bool:
 
 
 def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) -> bool:
-    title = (result.get("title") or query).strip()
-    artist_name = _entry_artist_name(result, query)
+    raw_title = (result.get("title") or query).strip()
+    raw_artist_name = _entry_artist_name(result, query)
+    title = title_without_artist_prefix(raw_title)
+    artist_name = clean_provider_artist(raw_title, raw_artist_name, query)
     provider_name = str(provider["name"])
     source_url = _candidate_source_url(provider_name, result)
     if not title or not artist_name or not source_url or not _is_allowed_provider_entry(provider_name, result):
