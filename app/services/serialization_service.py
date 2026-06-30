@@ -11,6 +11,7 @@ from app.schemas.import_job import ImportJobRead
 from app.schemas.playlist import FavoriteRead, PlaylistRead
 from app.schemas.track import TrackRead
 from app.services.artist_cleanup_service import artist_from_title
+from app.services.cover_service import cover_url_for_client
 from app.services.normalization_service import normalize_name
 
 
@@ -91,12 +92,16 @@ def track_to_read(track: Track) -> TrackRead:
     parsed_artist = _popular_artist_from_title(track.title) or artist_from_title(track.title)
     if parsed_artist and artists and normalize_name(artists[0].name) != normalize_name(parsed_artist):
         artists[0] = artists[0].model_copy(update={"name": parsed_artist})
+    cover_url = cover_url_for_client(track.cover_url) or fallback_cover_data_url(
+        track.title,
+        parsed_artist or (artists[0].name if artists else ""),
+    )
     return TrackRead(
         id=track.id,
         title=track.title,
         normalized_title=track.normalized_title,
         duration_seconds=track.duration_seconds,
-        cover_url=track.cover_url or fallback_cover_data_url(track.title, parsed_artist or (artists[0].name if artists else "")),
+        cover_url=cover_url,
         genre=track.genre,
         tags=parse_json_list(track.tags_json),
         language=track.language,

@@ -33,12 +33,12 @@ TOP_PRIORITY_ARTISTS = tuple(
     )
 )
 RARE_MIX_ARTISTS = tuple(normalize_name(name) for name in ("tuborosho", "anonymous ember"))
-POPULAR_POOL_SCAN_LIMIT = 420
-POPULAR_POOL_TARGET = 80
-POPULAR_TOP_HEAD_LIMIT = 6
+POPULAR_POOL_SCAN_LIMIT = 2200
+POPULAR_POOL_TARGET = 220
+POPULAR_TOP_HEAD_LIMIT = 36
 POPULAR_HEAD_PER_ARTIST_LIMIT = 2
-POPULAR_TOTAL_PER_ARTIST_LIMIT = 5
-POPULAR_OTHER_PER_ARTIST_LIMIT = 2
+POPULAR_TOTAL_PER_ARTIST_LIMIT = 28
+POPULAR_OTHER_PER_ARTIST_LIMIT = 4
 POPULAR_RARE_LIMIT = 2
 POPULAR_BLOCKED_PHRASES = (
     "home loan",
@@ -208,7 +208,7 @@ def list_random_tracks(db: Session, limit: int = 12) -> list[Track]:
 
 
 def list_trending_tracks(db: Session, limit: int = 12) -> list[Track]:
-    requested_limit = max(1, min(int(limit), 20))
+    requested_limit = max(1, min(int(limit), 200))
     stmt = (
         with_artists(filtered_feed_stmt())
         .join(TrackArtist)
