@@ -555,14 +555,22 @@ def _seek_context(
     duration_seconds: int | None = None,
 ) -> tuple[float, int | None, int | None, int]:
     range_start = _range_start(request.headers.get("range"))
-    start_seconds = max(0.0, float(start or 0.0))
-    if range_start is not None:
-        start_seconds = max(start_seconds, range_start / MP3_BYTES_PER_SECOND)
-    start_byte = range_start if range_start is not None else int(start_seconds * MP3_BYTES_PER_SECOND)
+    explicit_start = max(0.0, float(start or 0.0))
+    if explicit_start > 0:
+        # A client-side timeline seek opens a fresh transcoded stream. It is
+        # not a byte range of the previous response, so presenting it as one
+        # makes WebView media stacks reject the response after forward seeks.
+        start_seconds = explicit_start
+        start_byte = int(start_seconds * MP3_BYTES_PER_SECOND)
+        range_start = None
+        status_code = 200
+    else:
+        start_seconds = (range_start or 0) / MP3_BYTES_PER_SECOND
+        start_byte = range_start or 0
+        status_code = 206 if range_start is not None else 200
     total_bytes = None
     if duration_seconds and duration_seconds > 0:
         total_bytes = max(start_byte + 1, math.ceil(duration_seconds * MP3_BYTES_PER_SECOND))
-    status_code = 206 if range_start is not None or start_seconds > 0 else 200
     return start_seconds, range_start, total_bytes, status_code
 
 
@@ -574,6 +582,8 @@ def _mp3_stream_headers(start_byte: int, total_bytes: int | None, status_code: i
             headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{total_bytes}"
         else:
             headers["Content-Range"] = f"bytes {start_byte}-/*"
+    elif start_byte > 0:
+        headers.pop("Accept-Ranges", None)
     return headers
 
 
