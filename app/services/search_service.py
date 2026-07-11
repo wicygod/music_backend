@@ -23,7 +23,7 @@ from app.schemas.track import TrackRead
 from app.schemas.track import TrackSeedCreate
 from app.services.artist_cleanup_service import clean_provider_artist, provider_authority_score, title_without_artist_prefix
 from app.services.cover_service import extract_cover_url, fetch_soundcloud_oembed_cover
-from app.services.normalization_service import normalize_name
+from app.services.normalization_service import detect_artist_region, normalize_name
 from app.services.serialization_service import track_to_read
 from app.services.proxy_rotator import proxy_rotator
 from app.services.track_filter_service import dedupe_tracks, is_music_track
@@ -568,7 +568,7 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
             duplicate.source_external_id = external_id
             duplicate.source_url = str(source_url)
             duplicate.cover_url = duplicate.cover_url or cover_url
-            duplicate.genre = duplicate.genre or result.get("genre") or provider["default_genre"]
+            duplicate.genre = duplicate.genre or result.get("genre") or None
             _ensure_query_tag(duplicate, query)
             db.add(duplicate)
             db.commit()
@@ -588,9 +588,9 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
     artist, _created = find_or_create_artist(
         db,
         name=artist_name,
-        region="global",
+        region=detect_artist_region(artist_name),
         avatar_url=artist_url,
-        genres=[str(provider["tag"])],
+        genres=[],
         source_name=provider_name,
         source_external_id=str(result.get("uploader_id") or result.get("channel_id") or artist_name),
         source_url=artist_url,
@@ -601,9 +601,9 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
         artist=artist_name,
         duration_seconds=duration_seconds,
         cover_url=cover_url,
-        genre=result.get("genre") or provider["default_genre"],
+        genre=result.get("genre") or None,
         tags=["provider", str(provider["tag"]), *([_query_tag(query)] if _query_tag(query) else [])],
-        region="global",
+        region=detect_artist_region(artist_name),
         popularity_score=float(provider["popularity_score"]),
         quality_score=100.0,
         is_playable=True,

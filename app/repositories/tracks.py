@@ -1,5 +1,5 @@
 import json
-import random
+from datetime import datetime, timezone
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, selectinload
@@ -14,6 +14,7 @@ from app.services.artist_cleanup_service import (
     primary_artist_segment,
 )
 from app.services.normalization_service import normalize_name, normalize_title, normalize_track_title_for_dedupe
+from app.services.popular_ranking_service import PopularCandidate, rank_popular_candidates
 
 
 TOP_PRIORITY_ARTISTS = tuple(
@@ -34,12 +35,8 @@ TOP_PRIORITY_ARTISTS = tuple(
 )
 RARE_MIX_ARTISTS = tuple(normalize_name(name) for name in ("tuborosho", "anonymous ember"))
 POPULAR_POOL_SCAN_LIMIT = 2200
-POPULAR_POOL_TARGET = 220
-POPULAR_TOP_HEAD_LIMIT = 36
-POPULAR_HEAD_PER_ARTIST_LIMIT = 2
-POPULAR_TOTAL_PER_ARTIST_LIMIT = 28
-POPULAR_OTHER_PER_ARTIST_LIMIT = 4
-POPULAR_RARE_LIMIT = 2
+POPULAR_POOL_TARGET = 400
+POPULAR_POOL_PER_ARTIST_LIMIT = 12
 POPULAR_BLOCKED_PHRASES = (
     "home loan",
     "loan",
@@ -207,8 +204,13 @@ def list_random_tracks(db: Session, limit: int = 12) -> list[Track]:
     return list(db.execute(stmt).scalars().unique().all())
 
 
-def list_trending_tracks(db: Session, limit: int = 12) -> list[Track]:
-    requested_limit = max(1, min(int(limit), 200))
+def list_trending_tracks(
+    db: Session,
+    limit: int = 12,
+    rotation_key: str = "local",
+    excluded_song_keys: set[str] | None = None,
+) -> list[Track]:
+    requested_limit = max(1, min(int(limit), 120))
     stmt = (
         with_artists(filtered_feed_stmt())
         .join(TrackArtist)
@@ -222,12 +224,12 @@ def list_trending_tracks(db: Session, limit: int = 12) -> list[Track]:
     )
     candidates = list(db.execute(stmt).scalars().unique().all())
 
-    top_priority: list[Track] = []
-    rare_mix: list[Track] = []
-    other: list[Track] = []
+    popular_candidates: list[PopularCandidate[Track]] = []
     seen_song_keys: set[str] = set()
+    pool_artist_counts: dict[str, int] = {}
     duplicates_skipped = 0
     dirty_skipped = 0
+    artist_cap_skipped = 0
 
     for track in candidates:
         artist = _primary_artist_name(track)
@@ -244,97 +246,51 @@ def list_trending_tracks(db: Session, limit: int = 12) -> list[Track]:
         if not song_key:
             dirty_skipped += 1
             continue
+        if excluded_song_keys and song_key in excluded_song_keys:
+            continue
         if song_key in seen_song_keys:
             duplicates_skipped += 1
             continue
         seen_song_keys.add(song_key)
 
-        rank = _popular_artist_rank(display_artist)
-        if rank == "top":
-            top_priority.append(track)
-        elif rank == "rare":
-            rare_mix.append(track)
-        else:
-            other.append(track)
+        artist_key = _popular_artist_key(track)
+        if pool_artist_counts.get(artist_key, 0) >= POPULAR_POOL_PER_ARTIST_LIMIT:
+            artist_cap_skipped += 1
+            continue
+        pool_artist_counts[artist_key] = pool_artist_counts.get(artist_key, 0) + 1
+        popular_candidates.append(
+            PopularCandidate(
+                item=track,
+                stable_key=str(track.id),
+                artist_key=artist_key,
+                genre_key=_popular_genre_key(track),
+                region_key=normalize_name(track.region or "unknown") or "unknown",
+                popularity_score=track.popularity_score,
+                quality_score=track.quality_score,
+            )
+        )
 
-        if len(top_priority) + len(rare_mix) + len(other) >= POPULAR_POOL_TARGET:
+        if len(popular_candidates) >= POPULAR_POOL_TARGET:
             break
 
-    random.shuffle(top_priority)
-    random.shuffle(rare_mix)
-    random.shuffle(other)
-    top_pool_count = len(top_priority)
-    rare_pool_count = len(rare_mix)
-    other_pool_count = len(other)
-
-    artist_counts: dict[str, int] = {}
-    head_target = min(POPULAR_TOP_HEAD_LIMIT, requested_limit)
-    selected, top_rest = _take_with_artist_cap(
-        top_priority,
-        head_target,
-        artist_counts,
-        POPULAR_HEAD_PER_ARTIST_LIMIT,
+    rotation_seed = f"{datetime.now(timezone.utc).date().isoformat()}:{rotation_key or 'local'}"
+    ranked = rank_popular_candidates(
+        popular_candidates,
+        limit=requested_limit,
+        rotation_key=rotation_seed,
     )
-    if len(selected) < head_target:
-        fill, top_rest = _take_with_artist_cap(
-            top_rest,
-            head_target - len(selected),
-            artist_counts,
-            POPULAR_TOTAL_PER_ARTIST_LIMIT,
-        )
-        selected.extend(fill)
-
-    remaining_slots = requested_limit - len(selected)
-    rare_budget = 0
-    if rare_mix and remaining_slots > 0:
-        rare_roll = random.random()
-        rare_budget = 2 if rare_roll < 0.08 else 1 if rare_roll < 0.35 else 0
-        rare_budget = min(rare_budget, POPULAR_RARE_LIMIT, remaining_slots)
-
-    if remaining_slots - rare_budget > 0:
-        top_tail, top_rest = _take_with_artist_cap(
-            top_rest,
-            remaining_slots - rare_budget,
-            artist_counts,
-            POPULAR_TOTAL_PER_ARTIST_LIMIT,
-        )
-        selected.extend(top_tail)
-
-    remaining_slots = requested_limit - len(selected)
-    rare_take: list[Track] = []
-    if rare_budget > 0 and remaining_slots > 0:
-        rare_take, rare_mix = _take_with_artist_cap(
-            rare_mix,
-            min(rare_budget, remaining_slots),
-            artist_counts,
-            POPULAR_RARE_LIMIT,
-        )
-        selected.extend(rare_take)
-
-    remaining_slots = requested_limit - len(selected)
-    if remaining_slots > 0:
-        other_take, other_rest = _take_with_artist_cap(
-            other,
-            remaining_slots,
-            artist_counts,
-            POPULAR_OTHER_PER_ARTIST_LIMIT,
-        )
-        selected.extend(other_take)
-        remaining_slots = requested_limit - len(selected)
-        if remaining_slots > 0:
-            overflow = top_rest + rare_mix + other_rest
-            random.shuffle(overflow)
-            selected.extend(overflow[:remaining_slots])
-
-    selected_top = sum(1 for track in selected if _popular_artist_rank(_display_artist_for_popular(track)) == "top")
-    selected_rare = sum(1 for track in selected if _popular_artist_rank(_display_artist_for_popular(track)) == "rare")
-    selected_other = len(selected) - selected_top - selected_rare
+    selected = [candidate.item for candidate in ranked]
+    head = ranked[: min(24, len(ranked))]
+    head_artist_counts: dict[str, int] = {}
+    for candidate in head:
+        head_artist_counts[candidate.artist_key] = head_artist_counts.get(candidate.artist_key, 0) + 1
     print(
         "[POPULAR] "
-        f"pool={top_pool_count + rare_pool_count + other_pool_count} "
-        f"selected={len(selected)} selected_top={selected_top} selected_rare={selected_rare} selected_other={selected_other} "
-        f"top_pool={top_pool_count} rare_pool={rare_pool_count} other_pool={other_pool_count} "
-        f"duplicates_skipped={duplicates_skipped} dirty_skipped={dirty_skipped}",
+        f"pool={len(popular_candidates)} selected={len(selected)} "
+        f"head_unique_artists={len(head_artist_counts)} "
+        f"head_max_per_artist={max(head_artist_counts.values(), default=0)} "
+        f"duplicates_skipped={duplicates_skipped} dirty_skipped={dirty_skipped} "
+        f"artist_cap_skipped={artist_cap_skipped}",
         flush=True,
     )
     return selected
@@ -375,31 +331,13 @@ def _popular_artist_key(track: Track) -> str:
     return normalize_name(primary_artist_segment(display_artist)) or normalized or "unknown"
 
 
-def _take_with_artist_cap(
-    tracks: list[Track],
-    limit: int,
-    artist_counts: dict[str, int],
-    per_artist_limit: int,
-) -> tuple[list[Track], list[Track]]:
-    taken: list[Track] = []
-    rest: list[Track] = []
-    for track in tracks:
-        artist_key = _popular_artist_key(track)
-        if len(taken) < limit and artist_counts.get(artist_key, 0) < per_artist_limit:
-            taken.append(track)
-            artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
-        else:
-            rest.append(track)
-    return taken, rest
-
-
-def _popular_artist_rank(artist_name: str) -> str:
-    normalized = normalize_name(artist_name)
-    if any(name and (normalized == name or name in normalized or normalized in name) for name in TOP_PRIORITY_ARTISTS):
-        return "top"
-    if any(name and (normalized == name or name in normalized or normalized in name) for name in RARE_MIX_ARTISTS):
-        return "rare"
-    return "other"
+def _popular_genre_key(track: Track) -> str:
+    normalized = normalize_name(track.genre or "")
+    if not normalized:
+        return "unknown"
+    if any(token in normalized for token in ("soundcloud", "youtube", "http", "www", "unknown")):
+        return "unknown"
+    return normalized[:64]
 
 
 def list_region_tracks(db: Session, region: str, limit: int = 12) -> list[Track]:

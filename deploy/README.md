@@ -9,6 +9,16 @@ System user on VPS: musicbackend
 Systemd service: music-backend.service
 API port: 8000
 
+Store runtime secrets outside the repository in `/etc/music-backend.env`:
+
+```text
+MUSIC_APP_AUTH_TOKEN=...
+MUSIC_ADMIN_API_KEY=...
+MUSIC_JWT_SECRET=...
+```
+
+The file must be owned by `root:musicbackend` with mode `0640`.
+
 Health checks:
 
 ```bash

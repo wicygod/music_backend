@@ -32,6 +32,9 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
         if request.method == "OPTIONS" or not request.url.path.startswith("/api"):
             return await call_next(request)
 
+        if request.url.path == "/api/health":
+            return await call_next(request)
+
         if not self._has_app_token(request):
             return JSONResponse({"detail": "Unauthorized app token"}, status_code=401)
 
