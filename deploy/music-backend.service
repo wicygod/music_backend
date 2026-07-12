@@ -9,6 +9,7 @@ User=musicbackend
 Group=musicbackend
 WorkingDirectory=/opt/music_backend
 Environment=MUSIC_DATABASE_URL=sqlite:////opt/music_backend/music_catalog.db
+Environment=MUSIC_AUDIO_CACHE_DIR=/opt/music_backend/.audio_cache
 EnvironmentFile=/etc/music-backend.env
 ExecStart=/opt/music_backend/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
 Restart=always

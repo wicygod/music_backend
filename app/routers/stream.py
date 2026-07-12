@@ -1,9 +1,11 @@
 import asyncio
 import contextlib
-import math
+import hashlib
+import os
 import random
 import re
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, quote, quote_plus, urljoin, urlparse
@@ -12,7 +14,7 @@ import httpx
 import yt_dlp
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -27,8 +29,16 @@ STREAM_CACHE_TTL_SECONDS = 15 * 60
 STREAM_CACHE_REFRESH_MARGIN_SECONDS = 60
 HLS_STREAM_CACHE_TTL_SECONDS = 60
 MP3_BITRATE_KBPS = 192
-MP3_BYTES_PER_SECOND = MP3_BITRATE_KBPS * 1000 // 8
+AUDIO_CACHE_DIR = Path(
+    os.getenv("MUSIC_AUDIO_CACHE_DIR", str(Path(tempfile.gettempdir()) / "music_backend_audio_cache"))
+)
+AUDIO_CACHE_MAX_BYTES = max(
+    64 * 1024 * 1024,
+    int(os.getenv("MUSIC_AUDIO_CACHE_MAX_BYTES", str(512 * 1024 * 1024))),
+)
+MIN_CACHED_AUDIO_BYTES = 16 * 1024
 _stream_cache: dict[str, tuple[float, str]] = {}
+_audio_cache_tasks: dict[Path, asyncio.Task[Path]] = {}
 HLS_URI_RE = re.compile(r'URI="([^"]+)"')
 USER_AGENTS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -527,71 +537,51 @@ def _ffmpeg_headers_arg(headers: dict[str, str]) -> str:
     return "".join(f"{key}: {value}\r\n" for key, value in headers.items())
 
 
-async def _drain_ffmpeg_stderr(process: asyncio.subprocess.Process, stream_url: str) -> None:
-    if not process.stderr:
-        return
-    stderr = await process.stderr.read()
-    if stderr:
-        text = stderr.decode("utf-8", errors="replace").strip()
-        if text:
-            _log(f"[STREAM FFMPEG] stderr for {stream_url}: {text[-2000:]}")
+def _audio_cache_path(cache_key: str) -> Path:
+    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+    return AUDIO_CACHE_DIR / f"{digest}.mp3"
 
 
-def _range_start(range_header: str | None) -> int | None:
-    if not range_header:
-        return None
-    match = re.match(r"bytes=(\d+)-", range_header.strip(), flags=re.IGNORECASE)
-    if not match:
-        return None
+def _cached_audio_is_valid(path: Path) -> bool:
     try:
-        return max(0, int(match.group(1)))
-    except ValueError:
-        return None
+        return path.is_file() and path.stat().st_size >= MIN_CACHED_AUDIO_BYTES
+    except OSError:
+        return False
 
 
-def _seek_context(
-    request: Request,
-    start: float = 0.0,
-    duration_seconds: int | None = None,
-) -> tuple[float, int | None, int | None, int]:
-    range_start = _range_start(request.headers.get("range"))
-    explicit_start = max(0.0, float(start or 0.0))
-    if explicit_start > 0:
-        # A timeline seek opens a fresh constant-bitrate transcode. WebView2
-        # still expects partial-media semantics, but its automatic Range:
-        # bytes=0- belongs to the new request and must not reset the logical
-        # offset back to zero.
-        start_seconds = explicit_start
-        start_byte = int(start_seconds * MP3_BYTES_PER_SECOND)
-        range_start = None
-        status_code = 206
-    else:
-        start_seconds = (range_start or 0) / MP3_BYTES_PER_SECOND
-        start_byte = range_start or 0
-        status_code = 206 if range_start is not None else 200
-    total_bytes = None
-    if duration_seconds and duration_seconds > 0:
-        total_bytes = max(start_byte + 1, math.ceil(duration_seconds * MP3_BYTES_PER_SECOND))
-    return start_seconds, range_start, total_bytes, status_code
+def _trim_audio_cache(protected_path: Path) -> None:
+    try:
+        entries = sorted(
+            (item for item in AUDIO_CACHE_DIR.glob("*.mp3") if item.is_file()),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return
+
+    total_bytes = 0
+    for entry in entries:
+        try:
+            size = entry.stat().st_size
+        except OSError:
+            continue
+        total_bytes += size
+        if total_bytes <= AUDIO_CACHE_MAX_BYTES or entry == protected_path:
+            continue
+        with contextlib.suppress(OSError):
+            entry.unlink()
 
 
-def _mp3_stream_headers(start_byte: int, total_bytes: int | None, status_code: int) -> dict[str, str]:
-    headers = dict(MP3_HEADERS)
-    if status_code == 206:
-        if total_bytes:
-            end_byte = max(start_byte, total_bytes - 1)
-            headers["Content-Range"] = f"bytes {start_byte}-{end_byte}/{total_bytes}"
-        else:
-            headers["Content-Range"] = f"bytes {start_byte}-/*"
-    return headers
+async def _build_cached_mp3(stream_url: str, cache_path: Path) -> Path:
+    AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = cache_path.with_suffix(".part")
+    with contextlib.suppress(OSError):
+        temp_path.unlink()
 
-
-async def transcode_to_mp3(stream_url: str, start_seconds: float = 0.0):
     headers = _upstream_headers()
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
-        _log("[STREAM FFMPEG ERROR] ffmpeg binary not found")
-        raise RuntimeError("ffmpeg binary not found")
+        raise HTTPException(status_code=503, detail="ffmpeg is not installed on backend host")
 
     command = [
         ffmpeg_path,
@@ -603,69 +593,79 @@ async def transcode_to_mp3(stream_url: str, start_seconds: float = 0.0):
         headers["User-Agent"],
         "-headers",
         _ffmpeg_headers_arg(headers),
-    ]
-    if start_seconds > 0:
-        command.extend(["-ss", f"{start_seconds:.3f}"])
-    command.extend([
         "-i",
         stream_url,
         "-vn",
-        "-f",
-        "mp3",
+        "-map_metadata",
+        "-1",
         "-codec:a",
         "libmp3lame",
         "-b:a",
-        "192k",
-        "-",
-    ])
-    _log(f"[STREAM FFMPEG] Starting MP3 transcode start={start_seconds:.3f}s for {stream_url}")
+        f"{MP3_BITRATE_KBPS}k",
+        "-f",
+        "mp3",
+        "-y",
+        str(temp_path),
+    ]
+    _log(f"[STREAM CACHE] Building seekable MP3: {cache_path.name}")
     process = await asyncio.create_subprocess_exec(
         *command,
-        stdout=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-    stderr_task = asyncio.create_task(_drain_ffmpeg_stderr(process, stream_url))
+    stderr = await process.stderr.read() if process.stderr else b""
+    return_code = await process.wait()
+    if return_code != 0 or not _cached_audio_is_valid(temp_path):
+        with contextlib.suppress(OSError):
+            temp_path.unlink()
+        message = stderr.decode("utf-8", errors="replace").strip()
+        _log(f"[STREAM CACHE ERROR] ffmpeg rc={return_code}: {message[-2000:]}")
+        raise HTTPException(status_code=502, detail="Unable to prepare seekable audio")
+
+    os.replace(temp_path, cache_path)
+    _trim_audio_cache(cache_path)
+    _log(f"[STREAM CACHE] Ready: {cache_path.name} ({cache_path.stat().st_size} bytes)")
+    return cache_path
+
+
+async def _ensure_cached_mp3(stream_url: str, cache_key: str) -> Path:
+    cache_path = _audio_cache_path(cache_key)
+    if _cached_audio_is_valid(cache_path):
+        with contextlib.suppress(OSError):
+            os.utime(cache_path, None)
+        return cache_path
+
+    task = _audio_cache_tasks.get(cache_path)
+    if task is None or task.done():
+        task = asyncio.create_task(_build_cached_mp3(stream_url, cache_path))
+        _audio_cache_tasks[cache_path] = task
     try:
-        if not process.stdout:
-            return
-        while True:
-            chunk = await process.stdout.read(16 * 1024)
-            if not chunk:
-                break
-            yield chunk
+        return await asyncio.shield(task)
     finally:
-        if process.returncode is None:
-            process.terminate()
-            with contextlib.suppress(ProcessLookupError, asyncio.TimeoutError):
-                await asyncio.wait_for(process.wait(), timeout=2.0)
-        if process.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                process.kill()
-        with contextlib.suppress(Exception):
-            await stderr_task
-        _log(f"[STREAM FFMPEG] Finished MP3 transcode rc={process.returncode} for {stream_url}")
+        if task.done() and _audio_cache_tasks.get(cache_path) is task:
+            _audio_cache_tasks.pop(cache_path, None)
 
 
-def _stream_direct_url(
+async def _stream_direct_url(
     stream_url: str,
     request: Request,
     *,
     start: float = 0.0,
     duration_seconds: int | None = None,
-) -> StreamingResponse:
+    cache_key: str | None = None,
+) -> FileResponse:
     if not shutil.which("ffmpeg"):
         raise HTTPException(status_code=503, detail="ffmpeg is not installed on backend host")
-    start_seconds, range_start, total_bytes, status_code = _seek_context(request, start, duration_seconds)
-    start_byte = range_start if range_start is not None else int(start_seconds * MP3_BYTES_PER_SECOND)
-    _log(
-        f"[STREAM] Serving via ffmpeg MP3 transcode: hls={_is_hls_url(stream_url)} "
-        f"start={start_seconds:.3f}s status={status_code}"
-    )
-    return StreamingResponse(
-        transcode_to_mp3(stream_url, start_seconds=start_seconds),
-        status_code=status_code,
+    # WebView2 cannot reliably seek inside a live transcoding pipe: every byte
+    # range starts a new FFmpeg process and the media stack keeps probing nearby
+    # offsets. Build one complete constant-bitrate file, then let FileResponse
+    # serve real RFC 7233 ranges from disk.
+    effective_key = cache_key or f"stream:{stream_url}"
+    cache_path = await _ensure_cached_mp3(stream_url, effective_key)
+    return FileResponse(
+        cache_path,
         media_type="audio/mpeg",
-        headers=_mp3_stream_headers(start_byte, total_bytes, status_code),
+        headers=MP3_HEADERS,
     )
 
 
@@ -714,9 +714,9 @@ async def stream(
     request: Request,
     url: str = Query(..., min_length=1),
     start: float = Query(0.0, ge=0),
-) -> StreamingResponse:
+) -> FileResponse:
     stream_url = await _get_valid_stream_url(url)
-    return _stream_direct_url(stream_url, request, start=start)
+    return await _stream_direct_url(stream_url, request, start=start, cache_key=f"source:{url}")
 
 
 @router.get("/stream/track/{track_id}")
@@ -725,7 +725,7 @@ async def stream_track(
     request: Request,
     start: float = Query(0.0, ge=0),
     db: Session = Depends(get_db),
-) -> StreamingResponse:
+) -> FileResponse:
     track = get_track(db, track_id)
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
@@ -749,7 +749,13 @@ async def stream_track(
                 f"searching replacement source: {source_url} ({refresh_exc.detail})"
             )
             source_url, stream_url = await _refresh_track_source_and_stream(track, db, {source_url})
-    return _stream_direct_url(stream_url, request, start=start, duration_seconds=track.duration_seconds)
+    return await _stream_direct_url(
+        stream_url,
+        request,
+        start=start,
+        duration_seconds=track.duration_seconds,
+        cache_key=f"track:{track.id}:{source_url}",
+    )
 
 
 @router.get("/stream/proxy")
@@ -758,9 +764,9 @@ async def stream_proxy(
     segment_url: str | None = Query(None, min_length=1),
     url: str | None = Query(None, min_length=1),
     start: float = Query(0.0, ge=0),
-) -> StreamingResponse:
+) -> FileResponse:
     stream_url = segment_url or url
     if not stream_url:
         raise HTTPException(status_code=422, detail="segment_url is required")
     _log(f"[STREAM PROXY] Local segment endpoint hit: {stream_url}")
-    return _stream_direct_url(stream_url, request, start=start)
+    return await _stream_direct_url(stream_url, request, start=start, cache_key=f"proxy:{stream_url}")
