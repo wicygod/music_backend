@@ -23,7 +23,7 @@ from app.schemas.track import TrackRead
 from app.schemas.track import TrackSeedCreate
 from app.services.artist_cleanup_service import clean_provider_artist, provider_authority_score, title_without_artist_prefix
 from app.services.cover_service import extract_cover_url, fetch_soundcloud_oembed_cover
-from app.services.normalization_service import detect_artist_region, normalize_name
+from app.services.normalization_service import clean_display_artist_name, detect_artist_region, normalize_name
 from app.services.serialization_service import track_to_read
 from app.services.proxy_rotator import proxy_rotator
 from app.services.track_filter_service import dedupe_tracks, is_music_track
@@ -450,6 +450,20 @@ def _score_provider_result(query: str, entry: dict) -> int:
     return sum(1 for token in tokens if token in haystack)
 
 
+def _provider_query_relevance(query: str, entry: dict) -> int:
+    tokens = _query_tokens(query)
+    if not tokens:
+        return 0
+    title = normalize_name(str(entry.get("title") or ""))
+    artist = normalize_name(_entry_artist_name(entry, ""))
+    if all(token in artist for token in tokens):
+        return 4 if artist == normalize_name(query) else 3
+    if all(token in title for token in tokens):
+        return 2
+    combined = f"{artist} {title}"
+    return 1 if all(token in combined for token in tokens) else 0
+
+
 def _search_provider(query: str, provider: dict, limit: int) -> list[dict]:
     options = _yt_dlp_options(extract_flat=True)
     search_limit = max(1, min(EXTERNAL_PARSE_LIMIT, limit))
@@ -463,7 +477,10 @@ def _search_provider(query: str, provider: dict, limit: int) -> list[dict]:
 
     entries = [entry for entry in (info or {}).get("entries") or [] if isinstance(entry, dict)]
     provider_name = str(provider["name"])
-    playable = [entry for entry in entries if _is_allowed_provider_entry(provider_name, entry)]
+    playable = [
+        entry for entry in entries
+        if _is_allowed_provider_entry(provider_name, entry) and _provider_query_relevance(query, entry) > 0
+    ]
     seen = set()
     unique = []
     for entry in playable:
@@ -476,6 +493,7 @@ def _search_provider(query: str, provider: dict, limit: int) -> list[dict]:
     if provider_name == "youtube":
         unique.sort(
             key=lambda entry: (
+                _provider_query_relevance(query, entry),
                 provider_authority_score(entry.get("title"), _entry_artist_name(entry, ""), query),
                 -int(entry.get("_search_order") or 0),
             ),
@@ -484,6 +502,7 @@ def _search_provider(query: str, provider: dict, limit: int) -> list[dict]:
     else:
         unique.sort(
             key=lambda entry: (
+                _provider_query_relevance(query, entry),
                 provider_authority_score(entry.get("title"), _entry_artist_name(entry, ""), query),
                 _score_provider_result(query, entry),
             ),
@@ -534,6 +553,10 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
     raw_artist_name = _entry_artist_name(result, query)
     title = title_without_artist_prefix(raw_title)
     artist_name = clean_provider_artist(raw_title, raw_artist_name, query)
+    normalized_query = normalize_name(query)
+    normalized_raw_artist = normalize_name(raw_artist_name)
+    if artist_name and len(_query_tokens(query)) > 1 and normalized_raw_artist.startswith(normalized_query):
+        artist_name = clean_display_artist_name(query)
     provider_name = str(provider["name"])
     source_url = _candidate_source_url(provider_name, result)
     cover_url = extract_cover_url(result, provider_name=provider_name)

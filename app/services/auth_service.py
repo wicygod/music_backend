@@ -18,6 +18,7 @@ from app.schemas.auth import UserRead
 
 LOGIN_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,64}$")
 HASH_ITERATIONS = 120_000
+STREAM_TICKET_EXPIRES_SECONDS = 2 * 60
 
 
 def normalize_login(login: str) -> str:
@@ -55,9 +56,7 @@ def _b64url_decode(data: str) -> bytes:
     return base64.urlsafe_b64decode((data + padding).encode("ascii"))
 
 
-def create_access_token(user_id: int) -> str:
-    now = int(time.time())
-    payload = {"sub": str(user_id), "iat": now, "exp": now + JWT_EXPIRES_SECONDS}
+def _create_signed_token(payload: dict[str, Any]) -> str:
     header = {"alg": "HS256", "typ": "JWT"}
     signing_input = ".".join(
         [
@@ -69,7 +68,7 @@ def create_access_token(user_id: int) -> str:
     return f"{signing_input}.{_b64url(signature)}"
 
 
-def decode_access_token(token: str) -> dict[str, Any]:
+def _decode_signed_token(token: str) -> dict[str, Any]:
     try:
         header_b64, payload_b64, signature_b64 = token.split(".", 2)
         signing_input = f"{header_b64}.{payload_b64}"
@@ -83,6 +82,36 @@ def decode_access_token(token: str) -> dict[str, Any]:
         return payload
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid auth token") from exc
+
+
+def create_access_token(user_id: int) -> str:
+    now = int(time.time())
+    return _create_signed_token({"sub": str(user_id), "iat": now, "exp": now + JWT_EXPIRES_SECONDS})
+
+
+def decode_access_token(token: str) -> dict[str, Any]:
+    payload = _decode_signed_token(token)
+    if payload.get("scope"):
+        raise HTTPException(status_code=401, detail="Invalid auth token")
+    return payload
+
+
+def create_stream_ticket(user_id: int, track_id: int) -> str:
+    now = int(time.time())
+    return _create_signed_token({
+        "sub": str(user_id),
+        "track_id": int(track_id),
+        "scope": "stream",
+        "iat": now,
+        "exp": now + STREAM_TICKET_EXPIRES_SECONDS,
+    })
+
+
+def decode_stream_ticket(ticket: str, track_id: int) -> dict[str, Any]:
+    payload = _decode_signed_token(ticket)
+    if payload.get("scope") != "stream" or int(payload.get("track_id") or 0) != int(track_id):
+        raise HTTPException(status_code=401, detail="Invalid stream ticket")
+    return payload
 
 
 def user_to_read(user: User) -> UserRead:

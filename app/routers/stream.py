@@ -14,7 +14,7 @@ import httpx
 import yt_dlp
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -40,6 +40,8 @@ AUDIO_CACHE_MAX_BYTES = max(
 MIN_CACHED_AUDIO_BYTES = 16 * 1024
 _stream_cache: dict[str, tuple[float, str]] = {}
 _audio_cache_tasks: dict[Path, asyncio.Task[Path]] = {}
+_background_cache_tasks: set[asyncio.Task[Path]] = set()
+_background_cache_keys: set[str] = set()
 _audio_build_semaphore = asyncio.Semaphore(FFMPEG_BUILD_CONCURRENCY)
 HLS_URI_RE = re.compile(r'URI="([^"]+)"')
 USER_AGENTS = (
@@ -659,6 +661,65 @@ async def _ensure_cached_mp3(stream_url: str, cache_key: str) -> Path:
             _audio_cache_tasks.pop(cache_path, None)
 
 
+def _prepare_audio_cache_in_background(stream_url: str, cache_key: str) -> None:
+    if cache_key in _background_cache_keys:
+        return
+    _background_cache_keys.add(cache_key)
+
+    async def prepare() -> Path:
+        await asyncio.sleep(1.0)
+        return await _ensure_cached_mp3(stream_url, cache_key)
+
+    task = asyncio.create_task(prepare())
+    _background_cache_tasks.add(task)
+
+    def finish(completed: asyncio.Task[Path]) -> None:
+        _background_cache_tasks.discard(completed)
+        _background_cache_keys.discard(cache_key)
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            completed.result()
+
+    task.add_done_callback(finish)
+
+
+async def _proxy_progressive_audio(stream_url: str, request: Request) -> StreamingResponse:
+    headers = _upstream_headers()
+    range_header = request.headers.get("range")
+    if range_header:
+        headers["Range"] = range_header
+    client = httpx.AsyncClient(follow_redirects=True, timeout=None, headers=headers)
+    try:
+        upstream = await client.send(client.build_request("GET", stream_url), stream=True)
+        if upstream.status_code not in {200, 206}:
+            await upstream.aclose()
+            await client.aclose()
+            raise HTTPException(status_code=502, detail=f"Upstream audio failed: HTTP {upstream.status_code}")
+    except HTTPException:
+        raise
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail="Unable to open upstream audio") from exc
+
+    response_headers = dict(MP3_HEADERS)
+    for name in ("content-length", "content-range", "accept-ranges", "etag", "last-modified"):
+        value = upstream.headers.get(name)
+        if value:
+            response_headers[name.title()] = value
+    response_headers["X-Audio-Path"] = "progressive"
+    media_type = (upstream.headers.get("content-type") or _media_type_for(stream_url)).split(";", 1)[0]
+
+    async def body():
+        try:
+            async for chunk in upstream.aiter_raw(64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(body(), status_code=upstream.status_code, media_type=media_type, headers=response_headers)
+
+
 async def _stream_direct_url(
     stream_url: str,
     request: Request,
@@ -771,7 +832,7 @@ async def stream_track(
     request: Request,
     start: float = Query(0.0, ge=0),
     db: Session = Depends(get_db),
-) -> FileResponse:
+):
     track = get_track(db, track_id)
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
@@ -784,13 +845,30 @@ async def stream_track(
         return FileResponse(cache_path, media_type="audio/mpeg", headers=MP3_HEADERS)
 
     source_url, stream_url = await _resolve_track_stream(track, db, source_url)
-    return await _stream_direct_url(
-        stream_url,
-        request,
-        start=start,
-        duration_seconds=track.duration_seconds,
-        cache_key=_track_audio_cache_key(track.id, source_url),
-    )
+    cache_key = _track_audio_cache_key(track.id, source_url)
+    if not _is_hls_url(stream_url):
+        _prepare_audio_cache_in_background(stream_url, cache_key)
+        return await _proxy_progressive_audio(stream_url, request)
+    return await _stream_direct_url(stream_url, request, start=start, duration_seconds=track.duration_seconds, cache_key=cache_key)
+
+
+@router.post("/stream/track/{track_id}/ticket")
+def issue_stream_ticket(
+    track_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, int | str]:
+    from app.services.auth_service import STREAM_TICKET_EXPIRES_SECONDS, create_stream_ticket
+
+    user_id = getattr(request.state, "user_id", None)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="Missing auth user")
+    if not get_track(db, track_id):
+        raise HTTPException(status_code=404, detail="Track not found")
+    return {
+        "ticket": create_stream_ticket(int(user_id), track_id),
+        "expires_in": STREAM_TICKET_EXPIRES_SECONDS,
+    }
 
 
 @router.post("/stream/track/{track_id}/prepare")

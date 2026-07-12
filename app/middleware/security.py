@@ -11,7 +11,7 @@ from starlette.requests import Request
 from app.config import APP_AUTH_TOKEN, token_matches
 from app.database import SessionLocal
 from app.services.admin_monitor import record_event, record_session
-from app.services.auth_service import decode_access_token, is_user_banned
+from app.services.auth_service import decode_access_token, decode_stream_ticket, is_user_banned
 
 
 RATE_LIMIT_WINDOW_SECONDS = 2.0
@@ -19,6 +19,7 @@ RATE_LIMIT_MAX_REQUESTS = 3
 RATE_LIMIT_BLOCK_SECONDS = 120.0
 RATE_LIMIT_PATH_RE = re.compile(r"^/api/(?:search|stream)(?:/|$)")
 AUTH_EXEMPT_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login"}
+STREAM_TRACK_PATH_RE = re.compile(r"^/api/stream/track/(\d+)$")
 
 
 class LightweightSecurityMiddleware(BaseHTTPMiddleware):
@@ -35,21 +36,43 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
         if request.url.path == "/api/health":
             return await call_next(request)
 
-        if not self._has_app_token(request):
-            return JSONResponse({"detail": "Unauthorized app token"}, status_code=401)
-
         client_ip = self._client_ip(request)
-        auth_response = self._auth_response(request)
-        if auth_response:
-            return auth_response
+        ticket_auth = self._stream_ticket_auth(request, client_ip)
+        if isinstance(ticket_auth, JSONResponse):
+            return ticket_auth
+        if not ticket_auth:
+            if not self._has_app_token(request):
+                return JSONResponse({"detail": "Unauthorized app token"}, status_code=401)
+            auth_response = self._auth_response(request)
+            if auth_response:
+                return auth_response
 
         if RATE_LIMIT_PATH_RE.match(request.url.path):
-            limited_response = self._rate_limit_response(client_ip, request.url.path)
-            if limited_response:
-                return limited_response
-            self._record_request_event(request, client_ip)
+            if not ticket_auth:
+                limited_response = self._rate_limit_response(client_ip, request.url.path)
+                if limited_response:
+                    return limited_response
+            if not request.headers.get("range"):
+                self._record_request_event(request, client_ip)
 
         return await call_next(request)
+
+    def _stream_ticket_auth(self, request: Request, client_ip: str) -> bool | JSONResponse:
+        match = STREAM_TRACK_PATH_RE.match(request.url.path)
+        ticket = request.query_params.get("stream_ticket")
+        if not match or not ticket or request.method not in {"GET", "HEAD"}:
+            return False
+        try:
+            payload = decode_stream_ticket(ticket, int(match.group(1)))
+            user_id = int(payload["sub"])
+        except Exception:
+            return JSONResponse({"detail": "Invalid stream ticket"}, status_code=401)
+        with SessionLocal() as db:
+            if is_user_banned(db, user_id):
+                return JSONResponse({"detail": "Account is banned"}, status_code=403)
+        request.state.user_id = user_id
+        record_session(user_id, ip=client_ip)
+        return True
 
     def _has_app_token(self, request: Request) -> bool:
         header_token = request.headers.get("X-App-Token")
