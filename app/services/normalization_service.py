@@ -24,7 +24,7 @@ def normalize_track_title_for_dedupe(value: str) -> str:
 
 
 def normalize_artist_name(name: str) -> str:
-    cleaned = _QUOTE_RE.sub("'", name.strip())
+    cleaned = _QUOTE_RE.sub("'", name.strip()).replace("Ё", "Е").replace("ё", "е")
     cleaned = _ARTIST_ALLOWED_PUNCTUATION_RE.sub(" ", cleaned)
     cleaned = re.sub(r"\s*([/.&-])\s*", r" \1 ", cleaned)
     cleaned = _SPACES_RE.sub(" ", cleaned).strip().lower()
@@ -47,6 +47,6 @@ def detect_artist_region(name: str) -> str:
 
 
 def _normalize(value: str) -> str:
-    lowered = value.strip().lower()
+    lowered = value.strip().lower().replace("ё", "е")
     without_punctuation = _PUNCTUATION_RE.sub(" ", lowered)
     return _SPACES_RE.sub(" ", without_punctuation).strip()

@@ -164,12 +164,16 @@ def search_tracks(db: Session, query: str, limit: int = 50) -> list[Track]:
         return []
     pattern = f"%{normalized_query}%"
     title_pattern = f"%{normalize_title(query)}%"
+    normalized_track_title = func.replace(Track.normalized_title, "ё", "е")
+    normalized_artist_name = func.replace(Artist.normalized_name, "ё", "е")
+    normalized_genre = func.replace(Track.genre, "ё", "е")
+    normalized_tags = func.replace(Track.tags_json, "ё", "е")
     token_filters = [
         or_(
-            Track.normalized_title.like(f"%{token}%"),
-            Artist.normalized_name.like(f"%{token}%"),
-            Track.genre.like(f"%{token}%"),
-            Track.tags_json.like(f"%{token}%"),
+            normalized_track_title.like(f"%{token}%"),
+            normalized_artist_name.like(f"%{token}%"),
+            normalized_genre.like(f"%{token}%"),
+            normalized_tags.like(f"%{token}%"),
         )
         for token in normalized_query.split()
         if len(token) > 1
@@ -181,10 +185,10 @@ def search_tracks(db: Session, query: str, limit: int = 50) -> list[Track]:
         .join(Artist)
         .where(
             or_(
-                Track.normalized_title.like(title_pattern),
-                Artist.normalized_name.like(pattern),
-                Track.genre.like(pattern),
-                Track.tags_json.like(pattern),
+                normalized_track_title.like(title_pattern),
+                normalized_artist_name.like(pattern),
+                normalized_genre.like(pattern),
+                normalized_tags.like(pattern),
                 token_match,
             )
         )

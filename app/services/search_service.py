@@ -31,7 +31,7 @@ from app.services.track_filter_service import dedupe_tracks, is_music_track
 
 SEARCH_RESULT_LIMIT = 150
 EXTERNAL_PARSE_LIMIT = 50
-HYDRATION_COOLDOWN_SECONDS = 10 * 60
+HYDRATION_COOLDOWN_SECONDS = 2 * 60
 VARIANT_QUOTA = 2
 DEDUP_SIMILARITY_THRESHOLD = 0.88
 DEDUP_CATEGORY_QUOTAS = {
@@ -409,7 +409,10 @@ def _prefer_title_matches(items: list, query: str) -> list:
     if not items:
         return items
     title_matches = [item for item in items if _title_matches_query(_title_from_item(item), query)]
-    return title_matches or items
+    if not title_matches:
+        return items
+    title_match_ids = {id(item) for item in title_matches}
+    return [*title_matches, *(item for item in items if id(item) not in title_match_ids)]
 
 
 def _canonicalize_catalog_track_source(track) -> bool:
