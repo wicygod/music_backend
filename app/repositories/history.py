@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.history import ListeningHistory
@@ -54,3 +54,19 @@ def list_recent_history_tracks(db: Session, limit: int = 36, user_id: str = DEFA
         .limit(limit)
     )
     return list(db.execute(stmt).scalars().unique().all())
+
+
+def get_history_summary(db: Session, user_id: str = DEFAULT_USER_ID) -> dict[str, int]:
+    total_seconds, total_tracks = db.execute(
+        select(
+            func.coalesce(func.sum(Track.duration_seconds), 0),
+            func.count(ListeningHistory.id),
+        )
+        .select_from(ListeningHistory)
+        .join(Track, ListeningHistory.track_id == Track.id)
+        .where(ListeningHistory.user_id == user_id)
+    ).one()
+    return {
+        "total_seconds": max(0, int(total_seconds or 0)),
+        "total_tracks": max(0, int(total_tracks or 0)),
+    }

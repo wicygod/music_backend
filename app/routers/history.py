@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from app.database import get_db
-from app.repositories.history import list_recent_history_tracks, record_track_play
+from app.repositories.history import get_history_summary, list_recent_history_tracks, record_track_play
 from app.schemas.track import TrackRead
 from app.services.serialization_service import track_to_read
 
@@ -36,3 +36,11 @@ def recent_history(
     db: Session = Depends(get_db),
 ) -> list[TrackRead]:
     return [track_to_read(track) for track in list_recent_history_tracks(db, limit=limit, user_id=_history_user_id(request))]
+
+
+@router.get("/summary")
+def history_summary(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, int]:
+    return get_history_summary(db, user_id=_history_user_id(request))
