@@ -15,6 +15,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(256), nullable=False)
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     subscription_status: Mapped[str] = mapped_column(String(32), nullable=False, default="inactive")
+    total_listening_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
     block = relationship("BlockedUser", back_populates="user", uselist=False, cascade="all, delete-orphan")

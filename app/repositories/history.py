@@ -1,10 +1,11 @@
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.history import ListeningHistory
 from app.models.track import Track, TrackArtist
+from app.models.user import User
 from app.repositories.tracks import get_track
 
 
@@ -41,16 +42,29 @@ def list_recent_history_tracks(db: Session, limit: int = 36, user_id: str = DEFA
     return list(db.execute(stmt).scalars().unique().all())
 
 
-def get_history_summary(db: Session, user_id: str = DEFAULT_USER_ID) -> dict[str, int]:
-    total_seconds, total_tracks = db.execute(
-        select(
-            func.coalesce(func.sum(Track.duration_seconds), 0),
-            func.count(ListeningHistory.id),
-        )
+def add_listening_time(db: Session, account_id: int, seconds: int) -> None:
+    safe_seconds = max(0, min(int(seconds), 300))
+    if not safe_seconds:
+        return
+    db.execute(
+        update(User)
+        .where(User.id == account_id)
+        .values(total_listening_seconds=User.total_listening_seconds + safe_seconds)
+    )
+    db.commit()
+
+
+def get_history_summary(db: Session, user_id: str = DEFAULT_USER_ID, account_id: int | None = None) -> dict[str, int]:
+    total_tracks = db.execute(
+        select(func.count(ListeningHistory.id))
         .select_from(ListeningHistory)
-        .join(Track, ListeningHistory.track_id == Track.id)
         .where(ListeningHistory.user_id == user_id)
-    ).one()
+    ).scalar_one()
+    total_seconds = 0
+    if account_id is not None:
+        total_seconds = db.execute(
+            select(User.total_listening_seconds).where(User.id == account_id)
+        ).scalar_one_or_none() or 0
     return {
         "total_seconds": max(0, int(total_seconds or 0)),
         "total_tracks": max(0, int(total_tracks or 0)),

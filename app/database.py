@@ -71,6 +71,7 @@ def migrate_dev_schema() -> None:
                 "password_hash": "VARCHAR(256)",
                 "avatar_url": "TEXT",
                 "subscription_status": "VARCHAR(32) NOT NULL DEFAULT 'inactive'",
+                "total_listening_seconds": "INTEGER NOT NULL DEFAULT 0",
                 "created_at": "DATETIME",
             }
             for name, definition in user_column_defs.items():
