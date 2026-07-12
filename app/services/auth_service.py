@@ -18,7 +18,7 @@ from app.schemas.auth import UserRead
 
 LOGIN_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,64}$")
 HASH_ITERATIONS = 120_000
-STREAM_TICKET_EXPIRES_SECONDS = 2 * 60
+STREAM_TICKET_EXPIRES_SECONDS = 20 * 60
 
 
 def normalize_login(login: str) -> str:

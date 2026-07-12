@@ -408,11 +408,32 @@ def _title_matches_query(title: str | None, query: str) -> bool:
 def _prefer_title_matches(items: list, query: str) -> list:
     if not items:
         return items
-    title_matches = [item for item in items if _title_matches_query(_title_from_item(item), query)]
-    if not title_matches:
-        return items
-    title_match_ids = {id(item) for item in title_matches}
-    return [*title_matches, *(item for item in items if id(item) not in title_match_ids)]
+    tokens = _query_tokens(query)
+
+    def artist_text(item) -> str:
+        if isinstance(item, dict):
+            return _entry_artist_name(item, "")
+        direct = getattr(item, "artist", None)
+        if isinstance(direct, str):
+            return direct
+        return " ".join(
+            link.artist.name
+            for link in getattr(item, "artist_links", []) or []
+            if getattr(link, "artist", None) and link.artist.name
+        )
+
+    def rank(item) -> int:
+        artist = normalize_name(artist_text(item))
+        title = normalize_name(_title_from_item(item))
+        if tokens and all(token in artist for token in tokens):
+            return 0
+        if tokens and all(token in title for token in tokens):
+            return 1
+        if tokens and all(token in f"{artist} {title}" for token in tokens):
+            return 2
+        return 3
+
+    return [item for _index, item in sorted(enumerate(items), key=lambda pair: (rank(pair[1]), pair[0]))]
 
 
 def _canonicalize_catalog_track_source(track) -> bool:

@@ -3,13 +3,16 @@ from types import SimpleNamespace
 from app.services.search_service import _prefer_title_matches, _provider_query_relevance
 
 
-def test_title_matches_are_ranked_first_without_dropping_artist_matches() -> None:
-    artist_match = SimpleNamespace(title="Цветы")
-    title_match = SimpleNamespace(title="Темный принц и друзья")
+def test_exact_artist_matches_rank_before_title_only_matches() -> None:
+    artist_match = SimpleNamespace(
+        title="Цветы",
+        artist_links=[SimpleNamespace(artist=SimpleNamespace(name="Тёмный Принц"))],
+    )
+    title_match = SimpleNamespace(title="Темный принц и друзья", artist_links=[])
 
-    ranked = _prefer_title_matches([artist_match, title_match], "темный принц")
+    ranked = _prefer_title_matches([title_match, artist_match], "темный принц")
 
-    assert ranked == [title_match, artist_match]
+    assert ranked == [artist_match, title_match]
 
 
 def test_provider_relevance_prioritizes_artist_and_rejects_unrelated_items() -> None:
