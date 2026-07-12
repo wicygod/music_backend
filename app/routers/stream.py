@@ -29,6 +29,7 @@ STREAM_CACHE_TTL_SECONDS = 15 * 60
 STREAM_CACHE_REFRESH_MARGIN_SECONDS = 60
 HLS_STREAM_CACHE_TTL_SECONDS = 60
 MP3_BITRATE_KBPS = 192
+FFMPEG_BUILD_CONCURRENCY = max(1, int(os.getenv("MUSIC_FFMPEG_BUILD_CONCURRENCY", "1")))
 AUDIO_CACHE_DIR = Path(
     os.getenv("MUSIC_AUDIO_CACHE_DIR", str(Path(tempfile.gettempdir()) / "music_backend_audio_cache"))
 )
@@ -39,6 +40,7 @@ AUDIO_CACHE_MAX_BYTES = max(
 MIN_CACHED_AUDIO_BYTES = 16 * 1024
 _stream_cache: dict[str, tuple[float, str]] = {}
 _audio_cache_tasks: dict[Path, asyncio.Task[Path]] = {}
+_audio_build_semaphore = asyncio.Semaphore(FFMPEG_BUILD_CONCURRENCY)
 HLS_URI_RE = re.compile(r'URI="([^"]+)"')
 USER_AGENTS = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -229,7 +231,16 @@ def _cache_ttl_for_stream(stream_url: str) -> float:
 
 def _extract_stream_url(source_url: str) -> str:
     _log(f"[STREAM] Requested track URL: {source_url}")
-    options = _yt_dlp_options(format="bestaudio/best")
+    started_at = time.monotonic()
+    # Prefer a regular HTTP MP3/M4A response. It downloads and remuxes much
+    # faster than segmented HLS and still leaves HLS as a compatibility fallback.
+    options = _yt_dlp_options(
+        format=(
+            "bestaudio[protocol=https][ext=mp3]/bestaudio[protocol=http][ext=mp3]/"
+            "bestaudio[protocol=https][ext=m4a]/bestaudio[protocol=http][ext=m4a]/"
+            "bestaudio[protocol=https]/bestaudio[protocol=http]/bestaudio/best"
+        )
+    )
     with yt_dlp.YoutubeDL(options) as ydl:
         info = ydl.extract_info(source_url, download=False)
 
@@ -242,7 +253,8 @@ def _extract_stream_url(source_url: str) -> str:
         ext = str(info.get("ext") or "")
         format_id = str(info.get("format_id") or "unknown")
         kind = "HLS" if ".m3u8" in str(direct_url).lower() or "m3u8" in protocol else ext.upper() or "audio"
-        _log(f"[STREAM] yt-dlp selected format={format_id}, protocol={protocol}, type={kind}")
+        elapsed = time.monotonic() - started_at
+        _log(f"[STREAM] yt-dlp selected format={format_id}, protocol={protocol}, type={kind}, resolve={elapsed:.2f}s")
         return str(direct_url)
 
     formats = info.get("formats") or []
@@ -583,48 +595,49 @@ async def _build_cached_mp3(stream_url: str, cache_path: Path) -> Path:
     if not ffmpeg_path:
         raise HTTPException(status_code=503, detail="ffmpeg is not installed on backend host")
 
-    command = [
-        ffmpeg_path,
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-user_agent",
-        headers["User-Agent"],
-        "-headers",
-        _ffmpeg_headers_arg(headers),
-        "-i",
-        stream_url,
-        "-vn",
-        "-map_metadata",
-        "-1",
-        "-codec:a",
-        "libmp3lame",
-        "-b:a",
-        f"{MP3_BITRATE_KBPS}k",
-        "-f",
-        "mp3",
-        "-y",
-        str(temp_path),
+    base_command = [
+        ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-user_agent", headers["User-Agent"],
+        "-headers", _ffmpeg_headers_arg(headers),
+        "-i", stream_url, "-vn", "-map_metadata", "-1",
     ]
-    _log(f"[STREAM CACHE] Building seekable MP3: {cache_path.name}")
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stderr = await process.stderr.read() if process.stderr else b""
-    return_code = await process.wait()
-    if return_code != 0 or not _cached_audio_is_valid(temp_path):
-        with contextlib.suppress(OSError):
-            temp_path.unlink()
-        message = stderr.decode("utf-8", errors="replace").strip()
-        _log(f"[STREAM CACHE ERROR] ffmpeg rc={return_code}: {message[-2000:]}")
-        raise HTTPException(status_code=502, detail="Unable to prepare seekable audio")
+
+    async with _audio_build_semaphore:
+        started_at = time.monotonic()
+        _log(f"[STREAM CACHE] Building seekable MP3: {cache_path.name}")
+        last_error = ""
+        selected_mode = "copy"
+        for mode, codec_args in (
+            ("copy", ["-codec:a", "copy"]),
+            ("transcode", ["-codec:a", "libmp3lame", "-b:a", f"{MP3_BITRATE_KBPS}k"]),
+        ):
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
+            command = [*base_command, *codec_args, "-f", "mp3", "-y", str(temp_path)]
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stderr = await process.stderr.read() if process.stderr else b""
+            return_code = await process.wait()
+            if return_code == 0 and _cached_audio_is_valid(temp_path):
+                selected_mode = mode
+                break
+            last_error = stderr.decode("utf-8", errors="replace").strip()
+        else:
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
+            _log(f"[STREAM CACHE ERROR] ffmpeg failed: {last_error[-2000:]}")
+            raise HTTPException(status_code=502, detail="Unable to prepare seekable audio")
 
     os.replace(temp_path, cache_path)
     _trim_audio_cache(cache_path)
-    _log(f"[STREAM CACHE] Ready: {cache_path.name} ({cache_path.stat().st_size} bytes)")
+    elapsed = time.monotonic() - started_at
+    _log(
+        f"[STREAM CACHE] Ready: {cache_path.name} "
+        f"({cache_path.stat().st_size} bytes, mode={selected_mode}, build={elapsed:.2f}s)"
+    )
     return cache_path
 
 
