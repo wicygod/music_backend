@@ -1,19 +1,24 @@
 import secrets
+import shutil
 import string
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.config import ADMIN_API_KEY, token_matches
 from app.database import get_db
+from app.models.artist import Artist
 from app.models.history import ListeningHistory
 from app.models.playlist import UserFavorite, UserPlaylist, UserPlaylistTrack
 from app.models.track import Track, TrackArtist
 from app.models.user import BlockedUser, User
 from app.schemas.auth import BanRequest
-from app.services.admin_monitor import recent_events, record_event, system_stats
+from app.services.admin_monitor import activity_snapshot, recent_events, record_event, system_stats
 from app.services.auth_service import hash_password, user_to_read
 from app.services.serialization_service import track_to_read
 
@@ -31,6 +36,10 @@ class PasswordResetResponse(BaseModel):
     ok: bool
     temporary_password: str
     user: dict
+
+
+class AudioCachePruneRequest(BaseModel):
+    max_age_hours: int = Field(default=24, ge=1, le=24 * 30)
 
 
 def require_admin_key(x_admin_key: str | None = Header(None, alias="X-Admin-Key")) -> None:
@@ -94,6 +103,138 @@ def _user_payload(db: Session, user: User) -> dict:
     return payload
 
 
+def _catalog_metrics(db: Session) -> dict:
+    total_tracks = int(db.execute(select(func.count(Track.id))).scalar() or 0)
+    total_duration = int(db.execute(select(func.sum(Track.duration_seconds))).scalar() or 0)
+    source_rows = db.execute(
+        select(Track.source_name, func.count(Track.id).label("track_count"))
+        .group_by(Track.source_name)
+        .order_by(desc("track_count"))
+        .limit(5)
+    ).all()
+    return {
+        "tracks": total_tracks,
+        "artists": int(db.execute(select(func.count(Artist.id))).scalar() or 0),
+        "playable_tracks": int(
+            db.execute(select(func.count(Track.id)).where(Track.is_playable.is_(True))).scalar() or 0
+        ),
+        "needs_review": int(
+            db.execute(select(func.count(Track.id)).where(Track.needs_review.is_(True))).scalar() or 0
+        ),
+        "missing_covers": int(
+            db.execute(
+                select(func.count(Track.id)).where(
+                    or_(Track.cover_url.is_(None), func.trim(Track.cover_url) == "")
+                )
+            ).scalar()
+            or 0
+        ),
+        "duration_seconds": total_duration,
+        "sources": [
+            {"name": source_name or "unknown", "tracks": int(track_count)}
+            for source_name, track_count in source_rows
+        ],
+    }
+
+
+def _community_metrics(db: Session) -> dict:
+    week_ago = datetime.utcnow() - timedelta(days=7)
+    return {
+        "users": int(db.execute(select(func.count(User.id))).scalar() or 0),
+        "new_users_7d": int(
+            db.execute(select(func.count(User.id)).where(User.created_at >= week_ago)).scalar() or 0
+        ),
+        "subscribed_users": int(
+            db.execute(
+                select(func.count(User.id)).where(
+                    func.coalesce(User.subscription_status, "inactive") != "inactive"
+                )
+            ).scalar()
+            or 0
+        ),
+        "favorites": int(db.execute(select(func.count(UserFavorite.track_id))).scalar() or 0),
+        "playlists": int(db.execute(select(func.count(UserPlaylist.id))).scalar() or 0),
+        "playlist_tracks": int(db.execute(select(func.count(UserPlaylistTrack.track_id))).scalar() or 0),
+    }
+
+
+def _audio_cache_settings() -> tuple[Path, int]:
+    # Import lazily to keep the monitor independent from the streaming router at startup.
+    from app.routers.stream import AUDIO_CACHE_DIR, AUDIO_CACHE_MAX_BYTES
+
+    return Path(AUDIO_CACHE_DIR), int(AUDIO_CACHE_MAX_BYTES)
+
+
+def _audio_cache_overview() -> dict:
+    directory, max_bytes = _audio_cache_settings()
+    completed: list[tuple[Path, int, float]] = []
+    building = 0
+    try:
+        for item in directory.iterdir() if directory.is_dir() else ():
+            if not item.is_file():
+                continue
+            if item.suffix == ".part":
+                building += 1
+                continue
+            if item.suffix != ".mp3":
+                continue
+            try:
+                stat = item.stat()
+            except OSError:
+                continue
+            completed.append((item, int(stat.st_size), float(stat.st_mtime)))
+    except OSError:
+        completed = []
+
+    total_bytes = sum(size for _, size, _ in completed)
+    oldest = min((modified for _, _, modified in completed), default=None)
+    newest = max((modified for _, _, modified in completed), default=None)
+    stale_cutoff = time.time() - 24 * 60 * 60
+    disk_probe = directory if directory.exists() else directory.parent
+    try:
+        disk_free_bytes = int(shutil.disk_usage(disk_probe).free)
+    except OSError:
+        disk_free_bytes = 0
+
+    def as_iso(timestamp: float | None) -> str | None:
+        return datetime.utcfromtimestamp(timestamp).isoformat(timespec="seconds") + "Z" if timestamp else None
+
+    return {
+        "directory": str(directory),
+        "files": len(completed),
+        "building": building,
+        "bytes": total_bytes,
+        "max_bytes": max_bytes,
+        "usage_percent": round((total_bytes / max_bytes) * 100, 1) if max_bytes else 0,
+        "disk_free_bytes": disk_free_bytes,
+        "stale_files_24h": sum(modified < stale_cutoff for _, _, modified in completed),
+        "oldest_at": as_iso(oldest),
+        "newest_at": as_iso(newest),
+    }
+
+
+def _prune_audio_cache(max_age_hours: int) -> tuple[int, int]:
+    directory, _ = _audio_cache_settings()
+    cutoff = time.time() - max_age_hours * 60 * 60
+    removed_files = 0
+    freed_bytes = 0
+    try:
+        entries = tuple(directory.glob("*.mp3")) if directory.is_dir() else ()
+    except OSError:
+        entries = ()
+    for item in entries:
+        try:
+            stat = item.stat()
+            if stat.st_mtime >= cutoff:
+                continue
+            item.unlink()
+        except OSError:
+            continue
+        removed_files += 1
+        freed_bytes += int(stat.st_size)
+    return removed_files, freed_bytes
+
+
 @router.get("/stats", dependencies=[Depends(require_admin_key)])
 def admin_stats(db: Session = Depends(get_db)) -> dict:
     stats = system_stats()
@@ -107,6 +248,32 @@ def admin_stats(db: Session = Depends(get_db)) -> dict:
 @router.get("/logs", dependencies=[Depends(require_admin_key)])
 def admin_logs(limit: int = Query(80, ge=1, le=300)) -> dict:
     return {"events": recent_events(limit=limit)}
+
+
+@router.get("/overview", dependencies=[Depends(require_admin_key)])
+def admin_overview(db: Session = Depends(get_db)) -> dict:
+    return {
+        "catalog": _catalog_metrics(db),
+        "community": _community_metrics(db),
+        "activity": activity_snapshot(window_seconds=60 * 60, recent_limit=8),
+        "audio_cache": _audio_cache_overview(),
+    }
+
+
+@router.post("/cache/audio/prune", dependencies=[Depends(require_admin_key)])
+def prune_audio_cache(payload: AudioCachePruneRequest) -> dict:
+    removed_files, freed_bytes = _prune_audio_cache(payload.max_age_hours)
+    record_event(
+        "admin",
+        f"Admin pruned {removed_files} inactive audio cache file(s)",
+        path="/api/admin/cache/audio/prune",
+    )
+    return {
+        "ok": True,
+        "removed_files": removed_files,
+        "freed_bytes": freed_bytes,
+        "audio_cache": _audio_cache_overview(),
+    }
 
 
 @router.get("/users", dependencies=[Depends(require_admin_key)])

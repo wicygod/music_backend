@@ -709,6 +709,39 @@ async def _refresh_track_source_and_stream(
     raise last_error or HTTPException(status_code=404, detail="Playable source not found")
 
 
+async def _resolve_track_stream(
+    track: Track,
+    db: Session,
+    source_url: str | None = None,
+) -> tuple[str, str]:
+    """Resolve a playable upstream while preserving the stream retry policy."""
+    source_url = source_url or await _resolve_track_source(track, db)
+    try:
+        stream_url = await _get_valid_stream_url(source_url)
+    except HTTPException as exc:
+        if not _is_retryable_stream_error(exc):
+            raise
+        _log(
+            f"[STREAM TRACK] Existing stream failed for track_id={track.id}; "
+            f"refreshing stream URL: {source_url} ({exc.detail})"
+        )
+        try:
+            stream_url = await _get_valid_stream_url(source_url, refresh=True)
+        except HTTPException as refresh_exc:
+            if not _is_retryable_stream_error(refresh_exc):
+                raise
+            _log(
+                f"[STREAM TRACK] Source refresh failed for track_id={track.id}; "
+                f"searching replacement source: {source_url} ({refresh_exc.detail})"
+            )
+            source_url, stream_url = await _refresh_track_source_and_stream(track, db, {source_url})
+    return source_url, stream_url
+
+
+def _track_audio_cache_key(track_id: int, source_url: str) -> str:
+    return f"track:{track_id}:{source_url}"
+
+
 @router.get("/stream")
 async def stream(
     request: Request,
@@ -730,32 +763,55 @@ async def stream_track(
     if not track:
         raise HTTPException(status_code=404, detail="Track not found")
     source_url = await _resolve_track_source(track, db)
-    try:
-        stream_url = await _get_valid_stream_url(source_url)
-    except HTTPException as exc:
-        if not _is_retryable_stream_error(exc):
-            raise
-        _log(
-            f"[STREAM TRACK] Existing stream failed for track_id={track.id}; "
-            f"refreshing stream URL: {source_url} ({exc.detail})"
-        )
-        try:
-            stream_url = await _get_valid_stream_url(source_url, refresh=True)
-        except HTTPException as refresh_exc:
-            if not _is_retryable_stream_error(refresh_exc):
-                raise
-            _log(
-                f"[STREAM TRACK] Source refresh failed for track_id={track.id}; "
-                f"searching replacement source: {source_url} ({refresh_exc.detail})"
-            )
-            source_url, stream_url = await _refresh_track_source_and_stream(track, db, {source_url})
+    cache_key = _track_audio_cache_key(track.id, source_url)
+    cache_path = _audio_cache_path(cache_key)
+    if _cached_audio_is_valid(cache_path):
+        with contextlib.suppress(OSError):
+            os.utime(cache_path, None)
+        return FileResponse(cache_path, media_type="audio/mpeg", headers=MP3_HEADERS)
+
+    source_url, stream_url = await _resolve_track_stream(track, db, source_url)
     return await _stream_direct_url(
         stream_url,
         request,
         start=start,
         duration_seconds=track.duration_seconds,
-        cache_key=f"track:{track.id}:{source_url}",
+        cache_key=_track_audio_cache_key(track.id, source_url),
     )
+
+
+@router.post("/stream/track/{track_id}/prepare")
+async def prepare_track(
+    track_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> dict[str, int | bool | str]:
+    """Prepare the seekable MP3 cache without transferring the audio body."""
+    if getattr(request.state, "user_id", None) is None:
+        raise HTTPException(status_code=401, detail="Missing auth user")
+
+    track = get_track(db, track_id)
+    if not track:
+        raise HTTPException(status_code=404, detail="Track not found")
+
+    source_url = await _resolve_track_source(track, db)
+    cache_key = _track_audio_cache_key(track.id, source_url)
+    cache_path = _audio_cache_path(cache_key)
+    cache_hit = _cached_audio_is_valid(cache_path)
+    if cache_hit:
+        with contextlib.suppress(OSError):
+            os.utime(cache_path, None)
+    else:
+        source_url, stream_url = await _resolve_track_stream(track, db, source_url)
+        cache_key = _track_audio_cache_key(track.id, source_url)
+        cache_path = await _ensure_cached_mp3(stream_url, cache_key)
+
+    return {
+        "track_id": track.id,
+        "status": "ready",
+        "cache_hit": cache_hit,
+        "size_bytes": cache_path.stat().st_size,
+    }
 
 
 @router.get("/stream/proxy")

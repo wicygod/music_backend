@@ -39,6 +39,33 @@ def recent_events(limit: int = 80) -> list[dict[str, Any]]:
         return list(_events)[-limit:]
 
 
+def activity_snapshot(window_seconds: int = 60 * 60, recent_limit: int = 8) -> dict[str, Any]:
+    """Return a compact, lock-consistent view of recent operational activity."""
+    cutoff_ms = int((time.time() - max(60, window_seconds)) * 1000)
+    with _lock:
+        events = [event.copy() for event in _events if int(event.get("id") or 0) >= cutoff_ms]
+
+    def is_alert(event: dict[str, Any]) -> bool:
+        kind = str(event.get("kind") or "").lower()
+        message = str(event.get("message") or "").lower()
+        return kind in {"error", "rate-limit", "bugreport"} or any(
+            marker in message for marker in ("error", "failed", "unavailable", "blocked", "rejected")
+        )
+
+    streams = [event for event in events if event.get("kind") == "stream"]
+    alerts = [event for event in events if is_alert(event)]
+    return {
+        "window_seconds": max(60, window_seconds),
+        "total": len(events),
+        "streams": len(streams),
+        "searches": sum(event.get("kind") == "search" for event in events),
+        "admin_actions": sum(event.get("kind") == "admin" for event in events),
+        "alerts": len(alerts),
+        "recent_streams": list(reversed(streams[-recent_limit:])),
+        "recent_alerts": list(reversed(alerts[-recent_limit:])),
+    }
+
+
 def record_session(user_id: int | str, *, ip: str | None = None) -> None:
     key = f"user:{user_id}"
     if ip:
