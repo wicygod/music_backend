@@ -9,7 +9,7 @@ def request_with_range(value: str | None = None) -> Request:
     return Request({"type": "http", "method": "GET", "path": "/", "headers": headers})
 
 
-def test_explicit_timeline_seek_is_a_fresh_response_not_a_fake_byte_range() -> None:
+def test_explicit_timeline_seek_keeps_its_logical_offset_when_webview_sends_range_zero() -> None:
     start_seconds, range_start, total_bytes, status_code = _seek_context(
         request_with_range("bytes=0-"),
         start=92.5,
@@ -18,11 +18,11 @@ def test_explicit_timeline_seek_is_a_fresh_response_not_a_fake_byte_range() -> N
 
     assert start_seconds == 92.5
     assert range_start is None
-    assert status_code == 200
+    assert status_code == 206
     assert total_bytes == 240 * MP3_BYTES_PER_SECOND
     headers = _mp3_stream_headers(int(start_seconds * MP3_BYTES_PER_SECOND), total_bytes, status_code)
-    assert "Content-Range" not in headers
-    assert "Accept-Ranges" not in headers
+    assert headers["Content-Range"].startswith(f"bytes {int(start_seconds * MP3_BYTES_PER_SECOND)}-")
+    assert headers["Accept-Ranges"] == "bytes"
 
 
 def test_native_byte_range_remains_supported_for_initial_stream() -> None:
