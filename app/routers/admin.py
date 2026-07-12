@@ -21,6 +21,7 @@ from app.schemas.auth import BanRequest
 from app.services.admin_monitor import activity_snapshot, recent_events, record_event, system_stats
 from app.services.auth_service import hash_password, user_to_read
 from app.services.serialization_service import track_to_read
+from app.services.performance_metrics import performance_metrics
 
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -248,6 +249,11 @@ def admin_stats(db: Session = Depends(get_db)) -> dict:
 @router.get("/logs", dependencies=[Depends(require_admin_key)])
 def admin_logs(limit: int = Query(80, ge=1, le=300)) -> dict:
     return {"events": recent_events(limit=limit)}
+
+
+@router.get("/metrics", dependencies=[Depends(require_admin_key)])
+def admin_performance_metrics() -> dict:
+    return performance_metrics.snapshot()
 
 
 @router.get("/overview", dependencies=[Depends(require_admin_key)])

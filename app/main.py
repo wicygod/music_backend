@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.database import init_db
+from app.middleware.performance import PerformanceMetricsMiddleware
 from app.middleware.security import LightweightSecurityMiddleware
 from app.routers import admin, artists, auth, bugreport, feed, history, images, import_jobs, playlists, search, stream, tracks
 
@@ -29,6 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(LightweightSecurityMiddleware)
+app.add_middleware(PerformanceMetricsMiddleware)
 
 app.include_router(admin.router)
 app.include_router(auth.router)

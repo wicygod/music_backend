@@ -27,7 +27,7 @@ pip install -r requirements.txt
 SQLite is used by default:
 
 ```powershell
-python -m app.cli init-db
+alembic upgrade head
 ```
 
 The default database file is `music_catalog.db` in the repository root. This
@@ -37,7 +37,20 @@ example:
 
 ```powershell
 $env:MUSIC_DATABASE_URL = "sqlite:///./music_catalog.db"
+alembic upgrade head
 ```
+
+PostgreSQL is supported through psycopg. Create the database, set the URL, and
+run the same migrations before starting the API:
+
+```bash
+export MUSIC_DATABASE_URL="postgresql+psycopg://music:password@127.0.0.1:5432/music"
+alembic upgrade head
+```
+
+Production startup runs `alembic upgrade head` through the systemd unit before
+Uvicorn. `init_db()` still creates an empty schema for isolated development and
+test databases, but all changes to an existing schema belong in `migrations/`.
 
 ## Demo Seed
 
@@ -84,9 +97,6 @@ Invoke-RestMethod -Method Post http://127.0.0.1:8000/api/import/seed-artists
 Invoke-RestMethod http://127.0.0.1:8000/api/import/seed-artists/summary
 Invoke-RestMethod "http://127.0.0.1:8000/api/artists?priority=high&limit=20"
 ```
-
-Until Alembic is added, `init_db()` includes a small SQLite dev migration that
-adds the new artist seed columns to an existing local `music_catalog.db`.
 
 ## Metadata Providers
 
@@ -207,6 +217,14 @@ Health check:
 
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8000/api/health
+```
+
+The API returns a `Server-Timing` header for registration, search, stream
+ticket/setup, and listening-progress requests. Aggregated counts, failures,
+average, p50, and p95 latency are available to administrators:
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/admin/metrics -Headers @{ "X-Admin-Key" = $env:MUSIC_ADMIN_API_KEY; "X-App-Token" = $env:MUSIC_APP_AUTH_TOKEN }
 ```
 
 ## Endpoints

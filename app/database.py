@@ -1,7 +1,7 @@
 import os
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -29,51 +29,3 @@ def init_db() -> None:
     from app import models  # noqa: F401
 
     Base.metadata.create_all(bind=engine)
-    migrate_dev_schema()
-
-
-def migrate_dev_schema() -> None:
-    """Small dev-only schema drift helper until Alembic is introduced."""
-    from app import models  # noqa: F401
-
-    Base.metadata.create_all(bind=engine)
-    inspector = inspect(engine)
-    if "artists" not in inspector.get_table_names():
-        return
-
-    table_names = set(inspector.get_table_names())
-    columns = {column["name"] for column in inspector.get_columns("artists")}
-    artist_columns = {
-        "priority": "VARCHAR(32) NOT NULL DEFAULT 'normal'",
-        "tracks_target": "INTEGER NOT NULL DEFAULT 25",
-        "seed_source": "VARCHAR(128)",
-        "import_status": "VARCHAR(32) NOT NULL DEFAULT 'pending'",
-        "last_imported_at": "DATETIME",
-    }
-
-    with engine.begin() as connection:
-        for name, definition in artist_columns.items():
-            if name not in columns:
-                connection.execute(text(f"ALTER TABLE artists ADD COLUMN {name} {definition}"))
-
-        if "listening_history" in table_names:
-            history_columns = {column["name"] for column in inspector.get_columns("listening_history")}
-            if "user_id" not in history_columns:
-                connection.execute(
-                    text("ALTER TABLE listening_history ADD COLUMN user_id VARCHAR(128) NOT NULL DEFAULT 'local'")
-                )
-
-        if "users" in table_names:
-            user_columns = {column["name"] for column in inspector.get_columns("users")}
-            user_column_defs = {
-                "login": "VARCHAR(64)",
-                "nickname": "VARCHAR(96) NOT NULL DEFAULT 'User'",
-                "password_hash": "VARCHAR(256)",
-                "avatar_url": "TEXT",
-                "subscription_status": "VARCHAR(32) NOT NULL DEFAULT 'inactive'",
-                "total_listening_seconds": "INTEGER NOT NULL DEFAULT 0",
-                "created_at": "DATETIME",
-            }
-            for name, definition in user_column_defs.items():
-                if name not in user_columns:
-                    connection.execute(text(f"ALTER TABLE users ADD COLUMN {name} {definition}"))
