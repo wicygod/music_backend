@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from app.services.search_service import _prefer_title_matches, _provider_query_relevance
+from app.services.search_service import _is_allowed_provider_entry, _prefer_title_matches, _provider_query_relevance
 
 
 def test_exact_artist_matches_rank_before_title_only_matches() -> None:
@@ -23,3 +23,18 @@ def test_provider_relevance_prioritizes_artist_and_rejects_unrelated_items() -> 
     assert _provider_query_relevance("темный принц", exact_artist) == 4
     assert _provider_query_relevance("темный принц", title_match) == 2
     assert _provider_query_relevance("темный принц", unrelated) == 0
+
+
+def test_clams_casino_is_found_when_query_contains_claims_typo() -> None:
+    entry = {
+        "id": "claims-casino-all-i-need",
+        "title": "Clams Casino - All I Need",
+        "artist": "Clams Casino",
+        "channel": "Clams Casino - Topic",
+        "categories": ["Music"],
+        "webpage_url": "https://music.youtube.com/watch?v=claims123",
+        "duration": 204,
+    }
+
+    assert _provider_query_relevance("claims casino all i need", entry) > 0
+    assert _is_allowed_provider_entry("youtube", entry)

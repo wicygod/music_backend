@@ -1,8 +1,8 @@
 # Million Dollars Music Backend
 
-Metadata-only backend for the Million Dollars Music app. It stores artist,
-track, playlist, favorite, search cache, and import job metadata. It does not
-download audio or create streaming URLs.
+Authenticated catalog and playback backend for the Million Dollars Music app.
+It stores catalog and per-account data, resolves approved music providers, and
+serves ticketed seekable audio through a bounded local cache.
 
 ## Install
 
@@ -21,6 +21,11 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+Set unique values for `MUSIC_APP_AUTH_TOKEN`, `MUSIC_ADMIN_API_KEY`, and
+`MUSIC_JWT_SECRET` in the service environment before starting the API. Import
+endpoints require the admin key in `X-Admin-Key`; normal app endpoints require
+the app token and a signed account token.
 
 ## Database
 
@@ -210,8 +215,11 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 For a VPS process manager, use the same app import path without reload:
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000
+uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
+
+Expose production traffic only through an HTTPS reverse proxy; never publish
+Uvicorn port 8000 directly.
 
 Health check:
 

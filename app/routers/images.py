@@ -24,6 +24,7 @@ ALLOWED_IMAGE_HOSTS = (
     "is5-ssl.mzstatic.com",
 )
 RETRYABLE_IMAGE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
 
 @router.get("/proxy")
@@ -51,7 +52,15 @@ async def image_proxy(url: str = Query(..., min_length=8, max_length=2048)) -> R
                     await asyncio.sleep(0.2 * (attempt + 1))
                     continue
                 content_type = (candidate_response.headers.get("content-type") or "").lower()
-                if candidate_response.status_code < 400 and content_type.startswith("image/"):
+                final_host = (candidate_response.url.host or "").lower()
+                content_length = int(candidate_response.headers.get("content-length") or 0)
+                if (
+                    candidate_response.status_code < 400
+                    and content_type.startswith("image/")
+                    and _is_allowed_host(final_host)
+                    and content_length <= MAX_IMAGE_BYTES
+                    and len(candidate_response.content) <= MAX_IMAGE_BYTES
+                ):
                     response = candidate_response
                     break
                 if candidate_response.status_code not in RETRYABLE_IMAGE_STATUSES:

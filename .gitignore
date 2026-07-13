@@ -186,3 +186,4 @@ cython_debug/
 
 # Local secrets created during VPS setup. Do not commit private keys.
 secrets/
+backups/

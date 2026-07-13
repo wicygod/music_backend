@@ -50,7 +50,7 @@ def require_admin_key(x_admin_key: str | None = Header(None, alias="X-Admin-Key"
 
 def _top_tracks(db: Session, limit: int = 10) -> list[dict]:
     stmt = (
-        select(Track, func.count(ListeningHistory.id).label("play_count"))
+        select(Track, func.sum(ListeningHistory.play_count).label("play_count"))
         .join(ListeningHistory, ListeningHistory.track_id == Track.id)
         .options(selectinload(Track.artist_links).selectinload(TrackArtist.artist))
         .group_by(Track.id)
@@ -88,7 +88,7 @@ def _user_metrics(db: Session, user_id: int) -> dict:
         )
     return {
         "history_count": int(
-            db.execute(select(func.count(ListeningHistory.id)).where(ListeningHistory.user_id == scope)).scalar() or 0
+            db.execute(select(func.sum(ListeningHistory.play_count)).where(ListeningHistory.user_id == scope)).scalar() or 0
         ),
         "favorites_count": int(
             db.execute(select(func.count(UserFavorite.track_id)).where(UserFavorite.user_id == scope)).scalar() or 0
@@ -241,7 +241,7 @@ def admin_stats(db: Session = Depends(get_db)) -> dict:
     stats = system_stats()
     stats["top_tracks"] = _top_tracks(db, limit=10)
     stats["total_users"] = int(db.execute(select(func.count(User.id))).scalar() or 0)
-    stats["total_plays"] = int(db.execute(select(func.count(ListeningHistory.id))).scalar() or 0)
+    stats["total_plays"] = int(db.execute(select(func.sum(ListeningHistory.play_count))).scalar() or 0)
     stats["banned_users"] = int(db.execute(select(func.count(BlockedUser.id))).scalar() or 0)
     return stats
 

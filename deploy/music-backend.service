@@ -8,18 +8,22 @@ Type=simple
 User=musicbackend
 Group=musicbackend
 WorkingDirectory=/opt/music_backend
-Environment=MUSIC_DATABASE_URL=sqlite:////opt/music_backend/music_catalog.db
-Environment=MUSIC_AUDIO_CACHE_DIR=/opt/music_backend/.audio_cache
+Environment=MUSIC_DATABASE_URL=sqlite:////var/lib/music-backend/music_catalog.db
+Environment=MUSIC_AUDIO_CACHE_DIR=/var/cache/music-backend/audio
 EnvironmentFile=/etc/music-backend.env
 ExecStartPre=/opt/music_backend/.venv/bin/alembic upgrade head
-ExecStart=/opt/music_backend/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+ExecStart=/opt/music_backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=full
-ReadWritePaths=/opt/music_backend
+StateDirectory=music-backend
+StateDirectoryMode=0750
+CacheDirectory=music-backend
+CacheDirectoryMode=0750
+ReadWritePaths=/var/lib/music-backend /var/cache/music-backend
 
 [Install]
 WantedBy=multi-user.target

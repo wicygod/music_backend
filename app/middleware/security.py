@@ -14,11 +14,8 @@ from app.services.admin_monitor import record_event, record_session
 from app.services.auth_service import decode_access_token, decode_stream_ticket, is_user_banned
 
 
-RATE_LIMIT_WINDOW_SECONDS = 2.0
-RATE_LIMIT_MAX_REQUESTS = 3
-RATE_LIMIT_BLOCK_SECONDS = 120.0
-RATE_LIMIT_PATH_RE = re.compile(r"^/api/(?:search|stream)(?:/|$)")
-AUTH_EXEMPT_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login"}
+RATE_LIMIT_PATH_RE = re.compile(r"^/api/(?:search|stream|auth/(?:register|login))(?:/|$)")
+AUTH_EXEMPT_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login", "/api/images/proxy"}
 STREAM_TRACK_PATH_RE = re.compile(r"^/api/stream/track/(\d+)$")
 
 
@@ -28,6 +25,7 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
         self._lock = threading.Lock()
         self._requests: dict[str, deque[float]] = defaultdict(deque)
         self._blocked_until: dict[str, float] = {}
+        self._rate_limit_checks = 0
 
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS" or not request.url.path.startswith("/api"):
@@ -105,17 +103,42 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
         return parse_qs(request.url.query).get("auth_token", [None])[0]
 
     def _client_ip(self, request: Request) -> str:
-        forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-real-ip")
-        if forwarded:
-            return forwarded.split(",", 1)[0].strip()
-        if request.client:
-            return request.client.host
-        return "unknown"
+        peer_ip = request.client.host if request.client else "unknown"
+        if peer_ip in {"127.0.0.1", "::1"}:
+            forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-real-ip")
+            if forwarded:
+                return forwarded.split(",", 1)[0].strip()
+        return peer_ip
+
+    @staticmethod
+    def _rate_limit_policy(path: str) -> tuple[str, float, int, float]:
+        if path.startswith("/api/auth/"):
+            return "auth", 60.0, 10, 120.0
+        if path.endswith("/prepare"):
+            return "prepare", 60.0, 6, 30.0
+        if path.endswith("/ticket"):
+            return "ticket", 10.0, 20, 10.0
+        if path.startswith("/api/search"):
+            return "search", 5.0, 10, 15.0
+        return "stream", 5.0, 20, 10.0
 
     def _rate_limit_response(self, client_ip: str, path: str):
         now = time.monotonic()
+        category, window_seconds, max_requests, block_seconds = self._rate_limit_policy(path)
+        bucket_key = f"{client_ip}:{category}"
         with self._lock:
-            blocked_until = self._blocked_until.get(client_ip, 0)
+            self._rate_limit_checks += 1
+            if self._rate_limit_checks % 256 == 0:
+                cutoff = now - 180.0
+                self._blocked_until = {key: value for key, value in self._blocked_until.items() if value > now}
+                for key in list(self._requests):
+                    bucket = self._requests[key]
+                    while bucket and bucket[0] < cutoff:
+                        bucket.popleft()
+                    if not bucket:
+                        self._requests.pop(key, None)
+
+            blocked_until = self._blocked_until.get(bucket_key, 0)
             if blocked_until > now:
                 retry_after = max(1, int(blocked_until - now))
                 return JSONResponse(
@@ -124,18 +147,18 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
                     headers={"Retry-After": str(retry_after)},
                 )
 
-            bucket = self._requests[client_ip]
-            while bucket and now - bucket[0] > RATE_LIMIT_WINDOW_SECONDS:
+            bucket = self._requests[bucket_key]
+            while bucket and now - bucket[0] > window_seconds:
                 bucket.popleft()
             bucket.append(now)
-            if len(bucket) > RATE_LIMIT_MAX_REQUESTS:
-                self._blocked_until[client_ip] = now + RATE_LIMIT_BLOCK_SECONDS
+            if len(bucket) > max_requests:
+                self._blocked_until[bucket_key] = now + block_seconds
                 bucket.clear()
                 record_event("rate-limit", f"Rate limit blocked {client_ip} for {path}", ip=client_ip, path=path)
                 return JSONResponse(
                     {"detail": "Too Many Requests"},
                     status_code=429,
-                    headers={"Retry-After": str(int(RATE_LIMIT_BLOCK_SECONDS))},
+                    headers={"Retry-After": str(int(block_seconds))},
                 )
         return None
 

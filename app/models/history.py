@@ -13,6 +13,7 @@ class ListeningHistory(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
     user_id: Mapped[str] = mapped_column(String(128), nullable=False, default="local", index=True)
     track_id: Mapped[int] = mapped_column(ForeignKey("tracks.id", ondelete="CASCADE"), nullable=False, index=True)
+    play_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     played_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
     track = relationship("Track")

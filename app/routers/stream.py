@@ -79,7 +79,7 @@ BAD_VIDEO_TERMS_RE = re.compile(
     r"\b("
     r"reaction|review|tutorial|podcast|interview|vlog|blog|lets\s*play|let'?s\s*play|gameplay|"
     r"walkthrough|stream|live\s*stream|news|politics|mock(?:s|ed|ing)?|blast(?:s|ed|ing)?|"
-    r"claim(?:s|ed|ing)?|humiliation|hollywood|grammys|ai\s+music\s+video|ai\s+cover|"
+    r"humiliation|hollywood|grammys|ai\s+music\s+video|ai\s+cover|"
     r"relationship|robbed|bizarre|insecurity|celebrity|scandal|"
     r"обзор|реакц(?:ия|ии)|прохожд(?:ение|ения)|летсплей|стрим"
     r")\b",
@@ -822,8 +822,11 @@ async def stream(
     url: str = Query(..., min_length=1),
     start: float = Query(0.0, ge=0),
 ) -> FileResponse:
-    stream_url = await _get_valid_stream_url(url)
-    return await _stream_direct_url(stream_url, request, start=start, cache_key=f"source:{url}")
+    del request, url, start
+    raise HTTPException(
+        status_code=410,
+        detail="Direct URL streaming is disabled; use the ticketed track endpoint",
+    )
 
 
 @router.get("/stream/track/{track_id}")
@@ -912,8 +915,8 @@ async def stream_proxy(
     url: str | None = Query(None, min_length=1),
     start: float = Query(0.0, ge=0),
 ) -> FileResponse:
-    stream_url = segment_url or url
-    if not stream_url:
-        raise HTTPException(status_code=422, detail="segment_url is required")
-    _log(f"[STREAM PROXY] Local segment endpoint hit: {stream_url}")
-    return await _stream_direct_url(stream_url, request, start=start, cache_key=f"proxy:{stream_url}")
+    del request, segment_url, url, start
+    raise HTTPException(
+        status_code=410,
+        detail="Arbitrary URL proxying is disabled; use the ticketed track endpoint",
+    )

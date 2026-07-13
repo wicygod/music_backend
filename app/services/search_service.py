@@ -21,9 +21,15 @@ from app.repositories.tracks import (
 )
 from app.schemas.track import TrackRead
 from app.schemas.track import TrackSeedCreate
-from app.services.artist_cleanup_service import clean_provider_artist, provider_authority_score, title_without_artist_prefix
+from app.models.track import TrackArtist
+from app.services.artist_cleanup_service import (
+    artist_from_title,
+    clean_provider_artist,
+    provider_authority_score,
+    title_without_artist_prefix,
+)
 from app.services.cover_service import extract_cover_url, fetch_soundcloud_oembed_cover
-from app.services.normalization_service import clean_display_artist_name, detect_artist_region, normalize_name
+from app.services.normalization_service import clean_display_artist_name, detect_artist_region, normalize_name, normalize_title
 from app.services.serialization_service import track_to_read
 from app.services.proxy_rotator import proxy_rotator
 from app.services.track_filter_service import dedupe_tracks, is_music_track
@@ -68,7 +74,7 @@ BAD_VIDEO_TERMS_RE = re.compile(
     r"\b("
     r"reaction|review|tutorial|podcast|interview|vlog|blog|lets\s*play|let'?s\s*play|gameplay|"
     r"walkthrough|stream|live\s*stream|news|politics|mock(?:s|ed|ing)?|blast(?:s|ed|ing)?|"
-    r"claim(?:s|ed|ing)?|humiliation|hollywood|grammys|ai\s+music\s+video|ai\s+cover|"
+    r"humiliation|hollywood|grammys|ai\s+music\s+video|ai\s+cover|"
     r"relationship|robbed|bizarre|insecurity|celebrity|scandal|"
     r"обзор|реакц(?:ия|ии)|прохожд(?:ение|ения)|летсплей|стрим"
     r")\b",
@@ -386,15 +392,35 @@ def _catalog_track_matches_query(track, query: str) -> bool:
     )
     title_haystack = normalize_name(track.title)
     artist_haystack = normalize_name(artists)
-    if all(token in title_haystack for token in tokens):
+    tags_haystack = normalize_name(str(getattr(track, "tags_json", "") or ""))
+    if normalize_name(query) in tags_haystack:
         return True
-    if all(token in artist_haystack for token in tokens):
+    if _all_tokens_match(tokens, title_haystack):
         return True
-    return bool(tokens[0] in artist_haystack and all(token in title_haystack for token in tokens[1:]))
+    if _all_tokens_match(tokens, artist_haystack):
+        return True
+    return _all_tokens_match(tokens, f"{artist_haystack} {title_haystack}")
 
 
 def _query_tokens(query: str) -> list[str]:
     return [token for token in normalize_name(query).split() if len(token) > 1]
+
+
+def _token_matches_text(token: str, normalized_text: str) -> bool:
+    if token in normalized_text:
+        return True
+    if len(token) < 4:
+        return False
+    return any(
+        len(candidate) >= 4
+        and abs(len(token) - len(candidate)) <= 2
+        and SequenceMatcher(None, token, candidate).ratio() >= 0.84
+        for candidate in normalized_text.split()
+    )
+
+
+def _all_tokens_match(tokens: list[str], normalized_text: str) -> bool:
+    return bool(tokens) and all(_token_matches_text(token, normalized_text) for token in tokens)
 
 
 def _title_matches_query(title: str | None, query: str) -> bool:
@@ -402,7 +428,7 @@ def _title_matches_query(title: str | None, query: str) -> bool:
     if len(tokens) <= 1:
         return True
     haystack = normalize_name(title or "")
-    return all(token in haystack for token in tokens)
+    return _all_tokens_match(tokens, haystack)
 
 
 def _prefer_title_matches(items: list, query: str) -> list:
@@ -425,11 +451,11 @@ def _prefer_title_matches(items: list, query: str) -> list:
     def rank(item) -> int:
         artist = normalize_name(artist_text(item))
         title = normalize_name(_title_from_item(item))
-        if tokens and all(token in artist for token in tokens):
+        if _all_tokens_match(tokens, artist):
             return 0
-        if tokens and all(token in title for token in tokens):
+        if _all_tokens_match(tokens, title):
             return 1
-        if tokens and all(token in f"{artist} {title}" for token in tokens):
+        if _all_tokens_match(tokens, f"{artist} {title}"):
             return 2
         return 3
 
@@ -477,12 +503,12 @@ def _provider_query_relevance(query: str, entry: dict) -> int:
         return 0
     title = normalize_name(str(entry.get("title") or ""))
     artist = normalize_name(_entry_artist_name(entry, ""))
-    if all(token in artist for token in tokens):
+    if _all_tokens_match(tokens, artist):
         return 4 if artist == normalize_name(query) else 3
-    if all(token in title for token in tokens):
+    if _all_tokens_match(tokens, title):
         return 2
     combined = f"{artist} {title}"
-    return 1 if all(token in combined for token in tokens) else 0
+    return 1 if _all_tokens_match(tokens, combined) else 0
 
 
 def _search_provider(query: str, provider: dict, limit: int) -> list[dict]:
@@ -590,6 +616,31 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
     existing = find_track_by_provider_external_id(db, provider=provider_name, external_id=external_id)
     if existing:
         changed = _canonicalize_catalog_track_source(existing)
+        parsed_artist = artist_from_title(raw_title)
+        current_artists = {
+            normalize_name(link.artist.name)
+            for link in existing.artist_links
+            if getattr(link, "artist", None) and link.artist.name
+        }
+        if parsed_artist and normalize_name(parsed_artist) not in current_artists:
+            repaired_artist, _created = find_or_create_artist(
+                db,
+                name=parsed_artist,
+                region=detect_artist_region(parsed_artist),
+                avatar_url=_entry_artist_url(result),
+                genres=[],
+                source_name=provider_name,
+                source_external_id=str(result.get("uploader_id") or result.get("channel_id") or parsed_artist),
+                source_url=_entry_artist_url(result),
+                import_status="imported",
+            )
+            existing.artist_links.clear()
+            existing.artist_links.append(TrackArtist(artist=repaired_artist, role="main"))
+            changed = True
+        if existing.title != title:
+            existing.title = title
+            existing.normalized_title = normalize_title(title)
+            changed = True
         if cover_url and not existing.cover_url:
             existing.cover_url = cover_url
             changed = True
@@ -674,14 +725,19 @@ def _save_provider_tracks(
 ) -> int:
     accepted = 0
     provider_entries = _prefer_title_matches(_search_provider(query, provider, limit=EXTERNAL_PARSE_LIMIT), query)
-    for entry in provider_entries:
+    for entry_index, entry in enumerate(provider_entries):
         if accepted >= remaining:
             break
-        if not _take_with_song_dedupe(dedupe_groups, entry):
+        counted_for_results = _take_with_song_dedupe(dedupe_groups, entry)
+        # The existing catalog can contain low-quality duplicates that already
+        # fill a song quota. Still inspect the provider's best candidates so an
+        # authoritative result can be added or repair old metadata.
+        if not counted_for_results and entry_index >= 10:
             continue
         try:
             if _save_provider_entry(db, query, provider, entry):
-                accepted += 1
+                if counted_for_results:
+                    accepted += 1
         except Exception:
             db.rollback()
     return accepted

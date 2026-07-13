@@ -22,8 +22,9 @@ def record_track_play(db: Session, track_id: int, user_id: str = DEFAULT_USER_ID
     item = db.execute(stmt).scalars().first()
     if item:
         item.played_at = datetime.utcnow()
+        item.play_count = max(1, int(item.play_count or 0)) + 1
     else:
-        db.add(ListeningHistory(user_id=user_id, track_id=track_id, played_at=datetime.utcnow()))
+        db.add(ListeningHistory(user_id=user_id, track_id=track_id, play_count=1, played_at=datetime.utcnow()))
 
     db.flush()
     db.commit()

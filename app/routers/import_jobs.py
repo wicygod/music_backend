@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.config import ADMIN_API_KEY, token_matches
 from app.schemas.import_job import (
     ArtistJobProcessResult,
     ArtistsWithoutTracksResponse,
@@ -35,7 +36,16 @@ from app.services.import_service import (
 from app.services.serialization_service import import_job_to_read
 
 
-router = APIRouter(prefix="/api/import", tags=["import"])
+def require_admin_key(x_admin_key: str | None = Header(None, alias="X-Admin-Key")) -> None:
+    if not token_matches(ADMIN_API_KEY, x_admin_key):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+router = APIRouter(
+    prefix="/api/import",
+    tags=["import"],
+    dependencies=[Depends(require_admin_key)],
+)
 
 
 @router.post("/jobs", response_model=ImportJobRead, status_code=201)
