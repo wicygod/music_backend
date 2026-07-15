@@ -125,9 +125,12 @@ def test_genre_overlap_produces_similar_artist_recommendation() -> None:
         assert result.personalization_active is True
         assert by_track[preferred_track.id].recommendation_type == "selected"
         assert by_track[preferred_track.id].reason == (
-            "От Preferred Rock — выбран вами при регистрации"
+            "От Preferred Rock - выбран вами при регистрации"
         )
         assert by_track[similar_track.id].recommendation_type == "similar"
+        assert by_track[similar_track.id].reason == (
+            "Похоже на Preferred Rock - по вашим предпочтениям"
+        )
         assert unrelated_track.id in by_track
         assert similar_artist.id != preferred_artist.id
 
@@ -160,7 +163,7 @@ def test_behavioral_preference_reason_names_the_track_artist() -> None:
         recommended = next(item for item in result.items if item.track.id == track.id)
 
         assert recommended.recommendation_type == "selected"
-        assert recommended.reason == "От History Artist — на основе ваших предпочтений"
+        assert recommended.reason == "От History Artist - на основе ваших предпочтений"
 
     engine.dispose()
     invalidate_recommendations()

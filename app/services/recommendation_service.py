@@ -11,6 +11,7 @@ from time import monotonic
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
+from app.models.artist import Artist
 from app.models.history import ListeningHistory
 from app.models.personalization import UserArtistPreference
 from app.models.track import Track, TrackArtist
@@ -44,6 +45,12 @@ class RecommendationResult:
 class _CacheEntry:
     expires_at: float
     result: RecommendationResult
+
+
+@dataclass(frozen=True)
+class _SimilarArtistMatch:
+    score: float
+    preferred_artist_id: int
 
 
 _cache: OrderedDict[int, _CacheEntry] = OrderedDict()
@@ -263,6 +270,16 @@ def _score_candidates(
             collaborations[artist_id].update(other for other in artist_ids if other != artist_id)
 
     positive_preferences = {artist_id: value for artist_id, value in artist_preferences.items() if value > 0}
+    missing_artist_name_ids = set(positive_preferences) - set(artist_names)
+    if missing_artist_name_ids:
+        artist_names.update(
+            {
+                int(artist_id): str(name or "").strip()
+                for artist_id, name in db.execute(
+                    select(Artist.id, Artist.name).where(Artist.id.in_(missing_artist_name_ids))
+                ).all()
+            }
+        )
     max_preference = max(positive_preferences.values(), default=1.0)
     normalized_preferences = {
         artist_id: min(1.0, weight / max_preference)
@@ -307,7 +324,12 @@ def _score_candidates(
         negative_artist_signal = max((negative_preferences.get(item, 0.0) for item in artist_ids), default=0.0)
         genre_key = canonical_genre(track.genre) or "unknown"
         genre_signal = normalized_genres.get(genre_key, 0.0)
-        similar_signal = max((similar_artists.get(item, 0.0) for item in artist_ids), default=0.0)
+        similar_match = max(
+            (similar_artists[item] for item in artist_ids if item in similar_artists),
+            key=lambda item: item.score,
+            default=None,
+        )
+        similar_signal = similar_match.score if similar_match is not None else 0.0
         popularity_signal = (
             (max(0.0, float(track.popularity_score or 0.0)) - min_popularity) / popularity_range
             if popularity_range > 0
@@ -341,6 +363,9 @@ def _score_candidates(
             artist_preferences=normalized_preferences,
             artist_signal=artist_signal,
             similar_signal=similar_signal,
+            similar_reference_artist_id=(
+                similar_match.preferred_artist_id if similar_match is not None else None
+            ),
             genre_signal=genre_signal,
             popularity_signal=popularity_signal,
         )
@@ -364,8 +389,8 @@ def _similar_artist_scores(
     collaborations: dict[int, set[int]],
     artist_popularity_values: dict[int, list[float]],
     preferred_artist_ids: set[int],
-) -> dict[int, float]:
-    scores: dict[int, float] = {}
+) -> dict[int, _SimilarArtistMatch]:
+    scores: dict[int, _SimilarArtistMatch] = {}
     popularity = {
         artist_id: sum(values) / len(values)
         for artist_id, values in artist_popularity_values.items()
@@ -378,7 +403,8 @@ def _similar_artist_scores(
         if candidate_id in preferred_artist_ids:
             continue
         best = 0.0
-        for preferred_id in preferred_artist_ids:
+        best_preferred_id: int | None = None
+        for preferred_id in sorted(preferred_artist_ids):
             components: list[tuple[float, float]] = []
             preferred_genres = artist_genres.get(preferred_id, set())
             if candidate_genres and preferred_genres:
@@ -393,9 +419,14 @@ def _similar_artist_scores(
                 continue
             available_weight = sum(weight for weight, _ in components)
             similarity = sum(weight * value for weight, value in components) / available_weight
-            best = max(best, similarity)
-        if best > 0:
-            scores[candidate_id] = min(1.0, best)
+            if similarity > best:
+                best = similarity
+                best_preferred_id = preferred_id
+        if best > 0 and best_preferred_id is not None:
+            scores[candidate_id] = _SimilarArtistMatch(
+                score=min(1.0, best),
+                preferred_artist_id=best_preferred_id,
+            )
     return scores
 
 
@@ -466,6 +497,7 @@ def _recommendation_label(
     artist_preferences: dict[int, float],
     artist_signal: float,
     similar_signal: float,
+    similar_reference_artist_id: int | None,
     genre_signal: float,
     popularity_signal: float,
 ) -> tuple[str, str]:
@@ -481,10 +513,10 @@ def _recommendation_label(
         artist_name = artist_names.get(explicit_artist_id) or "выбранного артиста"
         explicit_source = explicit_artist_sources.get(explicit_artist_id, "explicit")
         if explicit_source == "onboarding":
-            return "selected", f"От {artist_name} — выбран вами при регистрации"
+            return "selected", f"От {artist_name} - выбран вами при регистрации"
         if explicit_source == "settings":
-            return "selected", f"От {artist_name} — выбран вами в настройках"
-        return "selected", f"От {artist_name} — выбран вами в музыкальном вкусе"
+            return "selected", f"От {artist_name} - выбран вами в настройках"
+        return "selected", f"От {artist_name} - выбран вами в музыкальном вкусе"
     if artist_signal > 0:
         preferred_artist_id = max(
             artist_ids,
@@ -493,9 +525,12 @@ def _recommendation_label(
         )
         artist_name = artist_names.get(preferred_artist_id or 0)
         if artist_name:
-            return "selected", f"От {artist_name} — на основе ваших предпочтений"
+            return "selected", f"От {artist_name} - на основе ваших предпочтений"
         return "selected", "На основе вашей истории прослушиваний"
     if similar_signal > 0:
+        reference_artist_name = artist_names.get(similar_reference_artist_id or 0)
+        if reference_artist_name:
+            return "similar", f"Похоже на {reference_artist_name} - по вашим предпочтениям"
         return "similar", "Похоже на любимых артистов"
     if genre_signal > 0:
         return "genre", "В жанрах, которые вам нравятся"
