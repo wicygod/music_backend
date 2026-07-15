@@ -12,7 +12,7 @@ class SubscriptionPlanRead(BaseModel):
     billing_period: Literal["month"]
     features: list[str]
     purchase_available: bool = False
-    checkout_mode: Literal["preview"] = "preview"
+    checkout_mode: Literal["preview", "mock"] = "preview"
 
 
 class SubscriptionStatusRead(BaseModel):
@@ -33,3 +33,11 @@ class CheckoutPreviewRead(BaseModel):
     plan: SubscriptionPlanRead
     activation_performed: bool = False
     message: str
+
+
+class MockCheckoutRead(BaseModel):
+    id: str
+    status: Literal["pending"] = "pending"
+    plan: SubscriptionPlanRead
+    checkout_url: str
+    expires_in_seconds: int = Field(gt=0, le=3600)

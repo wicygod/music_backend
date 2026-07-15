@@ -21,6 +21,7 @@ EVENT_WRITE_PATH_RE = re.compile(
     r"^/api/(?:history/events|feed/events|user/music-signals)(?:/|$)"
 )
 AUTH_EXEMPT_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login", "/api/images/proxy"}
+PUBLIC_SIGNED_GET_PATHS = {"/api/subscriptions/mock-payment"}
 STREAM_TRACK_PATH_RE = re.compile(r"^/api/stream/track/(\d+)$")
 
 
@@ -40,6 +41,11 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         client_ip = self._client_ip(request)
+        if request.method == "GET" and request.url.path in PUBLIC_SIGNED_GET_PATHS:
+            limited_response = self._rate_limit_response(client_ip, request.url.path)
+            if limited_response:
+                return limited_response
+            return await call_next(request)
         ticket_auth = self._stream_ticket_auth(request, client_ip)
         if isinstance(ticket_auth, JSONResponse):
             return ticket_auth
@@ -129,6 +135,8 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
             return "auth", 60.0, 10, 120.0
         if path.startswith("/api/subscriptions/checkout-preview"):
             return "checkout-preview", 60.0, 15, 60.0
+        if path.startswith("/api/subscriptions/mock-payment"):
+            return "mock-payment", 60.0, 30, 60.0
         if path.endswith("/prepare"):
             return "prepare", 60.0, 6, 30.0
         if path.endswith("/ticket"):

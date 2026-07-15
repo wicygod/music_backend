@@ -32,6 +32,7 @@ APP_AUTH_TOKEN = get_required_env("MUSIC_APP_AUTH_TOKEN")
 ADMIN_API_KEY = get_required_env("MUSIC_ADMIN_API_KEY")
 JWT_SECRET = get_required_env("MUSIC_JWT_SECRET")
 JWT_EXPIRES_SECONDS = get_int_env("MUSIC_JWT_EXPIRES_SECONDS", 60 * 60 * 24 * 30)
+PUBLIC_BASE_URL = (os.getenv("MUSIC_PUBLIC_BASE_URL") or "http://5.181.21.13:8000").strip().rstrip("/")
 BUGREPORT_SERVICE_URL = os.getenv("BUGREPORT_SERVICE_URL", "http://127.0.0.1:8001/api/bugreport")
 
 

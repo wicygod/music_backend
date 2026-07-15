@@ -20,6 +20,7 @@ from app.services.subscription_service import has_premium_entitlement
 LOGIN_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,64}$")
 HASH_ITERATIONS = 120_000
 STREAM_TICKET_EXPIRES_SECONDS = 20 * 60
+MOCK_CHECKOUT_EXPIRES_SECONDS = 10 * 60
 
 
 def normalize_login(login: str) -> str:
@@ -112,6 +113,24 @@ def decode_stream_ticket(ticket: str, track_id: int) -> dict[str, Any]:
     payload = _decode_signed_token(ticket)
     if payload.get("scope") != "stream" or int(payload.get("track_id") or 0) != int(track_id):
         raise HTTPException(status_code=401, detail="Invalid stream ticket")
+    return payload
+
+
+def create_mock_checkout_ticket(user_id: int, plan_id: str) -> str:
+    now = int(time.time())
+    return _create_signed_token({
+        "sub": str(user_id),
+        "plan_id": plan_id,
+        "scope": "mock-checkout",
+        "iat": now,
+        "exp": now + MOCK_CHECKOUT_EXPIRES_SECONDS,
+    })
+
+
+def decode_mock_checkout_ticket(ticket: str, plan_id: str) -> dict[str, Any]:
+    payload = _decode_signed_token(ticket)
+    if payload.get("scope") != "mock-checkout" or payload.get("plan_id") != plan_id:
+        raise HTTPException(status_code=401, detail="Invalid checkout token")
     return payload
 
 
