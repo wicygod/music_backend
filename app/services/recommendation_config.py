@@ -53,7 +53,30 @@ class RecommendationConfig:
     negative_artist_score_weight: float = get_float_env("MUSIC_TRACK_NEGATIVE_ARTIST_WEIGHT", 0.30)
     negative_preference_scale: float = get_float_env("MUSIC_NEGATIVE_PREFERENCE_SCALE", 5.0)
 
-    algorithm_version: str = "personalized-v1"
+    # Artist similarity is deliberately evidence based. A single broad genre
+    # match must not be presented to the user as "sounds like this artist".
+    similarity_min_score: float = get_float_env("MUSIC_SIMILARITY_MIN_SCORE", 0.36)
+    similarity_genre_weight: float = get_float_env("MUSIC_SIMILARITY_GENRE_WEIGHT", 0.18)
+    similarity_genre_family_weight: float = get_float_env(
+        "MUSIC_SIMILARITY_GENRE_FAMILY_WEIGHT",
+        0.06,
+    )
+    similarity_tag_weight: float = get_float_env("MUSIC_SIMILARITY_TAG_WEIGHT", 0.22)
+    similarity_audience_weight: float = get_float_env("MUSIC_SIMILARITY_AUDIENCE_WEIGHT", 0.27)
+    similarity_co_preference_weight: float = get_float_env(
+        "MUSIC_SIMILARITY_CO_PREFERENCE_WEIGHT",
+        0.12,
+    )
+    similarity_collaboration_weight: float = get_float_env(
+        "MUSIC_SIMILARITY_COLLABORATION_WEIGHT",
+        0.12,
+    )
+    similarity_popularity_weight: float = get_float_env(
+        "MUSIC_SIMILARITY_POPULARITY_WEIGHT",
+        0.03,
+    )
+
+    algorithm_version: str = "personalized-v2"
 
 
 RECOMMENDATION_CONFIG = RecommendationConfig()

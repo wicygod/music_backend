@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
+import re
 from collections import OrderedDict, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import blake2b
-from math import exp
+from math import exp, log1p, sqrt
 from threading import Lock
 from time import monotonic
 
@@ -34,6 +36,48 @@ _INVALID_GENRES = {
     "music",
 }
 
+_GENERIC_TAGS = _INVALID_GENRES | {
+    "audio",
+    "official",
+    "provider",
+    "track",
+    "untitled",
+}
+
+_GENRE_ALIASES: tuple[tuple[str, str, str], ...] = (
+    ("drum and bass", "drum-and-bass", "electronic"),
+    ("drum bass", "drum-and-bass", "electronic"),
+    ("dnb", "drum-and-bass", "electronic"),
+    ("hip hop rap", "hip-hop", "hip-hop"),
+    ("hip hop", "hip-hop", "hip-hop"),
+    ("rap hip hop", "hip-hop", "hip-hop"),
+    ("cloud rap", "cloud-rap", "hip-hop"),
+    ("alternative rock", "alternative-rock", "rock"),
+    ("alt rock", "alternative-rock", "rock"),
+    ("r b soul", "r-and-b", "r-and-b"),
+    ("rhythm and blues", "r-and-b", "r-and-b"),
+    ("dance edm", "dance-edm", "electronic"),
+    ("edm", "dance-edm", "electronic"),
+    ("electro", "electronic", "electronic"),
+    ("electronic", "electronic", "electronic"),
+    ("ambient", "ambient", "electronic"),
+    ("house", "house", "electronic"),
+    ("techno", "techno", "electronic"),
+    ("phonk", "phonk", "hip-hop"),
+    ("trap", "trap", "hip-hop"),
+    ("drill", "drill", "hip-hop"),
+    ("grime", "grime", "hip-hop"),
+    ("rap", "hip-hop", "hip-hop"),
+    ("indie", "indie", "alternative"),
+    ("alternative", "alternative", "alternative"),
+    ("rock", "rock", "rock"),
+    ("pop", "pop", "pop"),
+    ("country", "country", "country"),
+    ("classical", "classical", "classical"),
+    ("jazz", "jazz", "jazz"),
+    ("soundtrack", "soundtrack", "soundtrack"),
+)
+
 
 @dataclass(frozen=True)
 class RecommendationResult:
@@ -51,6 +95,18 @@ class _CacheEntry:
 class _SimilarArtistMatch:
     score: float
     preferred_artist_id: int
+    collaborative_score: float
+
+
+@dataclass(frozen=True)
+class _ArtistSimilarityFeatures:
+    genres: frozenset[str]
+    genre_families: frozenset[str]
+    tags: frozenset[str]
+    listeners: frozenset[str]
+    preference_users: frozenset[int]
+    followers_count: int
+    profile_quality: float
 
 
 _cache: OrderedDict[int, _CacheEntry] = OrderedDict()
@@ -119,6 +175,17 @@ def get_personalized_recommendations(
         "popular": RECOMMENDATION_CONFIG.popular_share,
         "exploration": RECOMMENDATION_CONFIG.exploration_share,
     }
+    available_types = {item.recommendation_type for item in scored}
+    if personalization_active and "similar" not in available_types:
+        # Sparse metadata should produce more tracks from known-good anchors,
+        # not a page of weak matches mislabeled as similar artists.
+        missing_similarity_share = shares["similar"]
+        shares["similar"] = 0.0
+        shares["selected"] += missing_similarity_share * 0.65
+        if "genre" in available_types:
+            shares["genre"] += missing_similarity_share * 0.35
+        else:
+            shares["exploration"] += missing_similarity_share * 0.35
     rotation_key = f"{datetime.now(timezone.utc).date().isoformat()}:{user_id}"
     mixed = choose_weighted_mix(
         scored,
@@ -203,11 +270,33 @@ def _load_candidates(db: Session, *, preferred_artist_ids: set[int]) -> list[Tra
             .where(TrackArtist.artist_id.in_(preferred_artist_ids))
             .distinct()
         ).scalars().all()
-        preferred_genres = {str(value) for value in raw_genres if canonical_genre(value)}
-        if preferred_genres:
+        preferred_genre_features: set[str] = set()
+        for raw_genre in raw_genres:
+            detailed, families = _genre_features(raw_genre)
+            preferred_genre_features.update(detailed | families)
+
+        # Discover spelling variants (Hip-Hop/Rap vs Hip-hop & Rap, EDM vs
+        # Dance & EDM, and so on) before the candidate pool is materialized.
+        # Only distinct genre strings are loaded, never the full track table.
+        available_raw_genres = db.execute(
+            select(Track.genre)
+            .where(
+                Track.genre.is_not(None),
+                Track.is_playable.is_(True),
+                Track.needs_review.is_(False),
+            )
+            .distinct()
+        ).scalars().all()
+        matching_raw_genres = {
+            str(raw_genre)
+            for raw_genre in available_raw_genres
+            if (_genre_features(raw_genre)[0] | _genre_features(raw_genre)[1])
+            & preferred_genre_features
+        }
+        if matching_raw_genres:
             genre_stmt = with_artists(
                 filtered_feed_stmt()
-                .where(Track.genre.in_(preferred_genres))
+                .where(Track.genre.in_(matching_raw_genres))
                 .order_by(Track.popularity_score.desc(), Track.quality_score.desc(), Track.id.desc())
                 .limit(max(100, candidate_limit // 2))
             )
@@ -248,26 +337,18 @@ def _score_candidates(
     hidden_artist_ids: set[int],
     personalization_active: bool,
 ) -> list[ScoredRecommendation[Track]]:
-    artist_genres: dict[int, set[str]] = defaultdict(set)
-    artist_popularity_values: dict[int, list[float]] = defaultdict(list)
-    collaborations: dict[int, set[int]] = defaultdict(set)
     track_artist_ids: dict[int, list[int]] = {}
     artist_names: dict[int, str] = {}
+    candidate_artist_ids: set[int] = set()
     explicit_artist_sources = explicit_artist_sources or {}
 
     for track in candidates:
         artist_ids = _track_artist_ids(track)
         track_artist_ids[track.id] = artist_ids
+        candidate_artist_ids.update(artist_ids)
         for link in track.artist_links:
             if link.artist_id and link.artist is not None:
                 artist_names[int(link.artist_id)] = str(link.artist.name or "").strip()
-        genre = canonical_genre(track.genre)
-        for artist_id in artist_ids:
-            if genre:
-                artist_genres[artist_id].add(genre)
-            artist_popularity_values[artist_id].append(max(0.0, float(track.popularity_score or 0.0)))
-        for artist_id in artist_ids:
-            collaborations[artist_id].update(other for other in artist_ids if other != artist_id)
 
     positive_preferences = {artist_id: value for artist_id, value in artist_preferences.items() if value > 0}
     missing_artist_name_ids = set(positive_preferences) - set(artist_names)
@@ -285,6 +366,11 @@ def _score_candidates(
         artist_id: min(1.0, weight / max_preference)
         for artist_id, weight in positive_preferences.items()
     }
+    similarity_features, collaborations = _load_artist_similarity_features(
+        db,
+        artist_ids=candidate_artist_ids | set(positive_preferences),
+        current_user_id=user_id,
+    )
     negative_preferences = {
         artist_id: min(
             1.0,
@@ -295,7 +381,10 @@ def _score_candidates(
     }
     preferred_genres: dict[str, float] = defaultdict(float)
     for artist_id, preference in normalized_preferences.items():
-        for genre in artist_genres.get(artist_id, set()):
+        profile = similarity_features.get(artist_id)
+        if profile is None:
+            continue
+        for genre in profile.genres | profile.genre_families:
             preferred_genres[genre] += preference
     max_genre_preference = max(preferred_genres.values(), default=1.0)
     normalized_genres = {
@@ -303,50 +392,96 @@ def _score_candidates(
         for genre, weight in preferred_genres.items()
     }
     similar_artists = _similar_artist_scores(
-        artist_genres=artist_genres,
+        features=similarity_features,
         collaborations=collaborations,
-        artist_popularity_values=artist_popularity_values,
-        preferred_artist_ids=set(positive_preferences),
+        preferred_artist_weights=normalized_preferences,
     )
     listened_counts, recent_listened_ids, quick_skip_counts = _history_signals(db, user_id=user_id)
 
     popular_values = [max(0.0, float(track.popularity_score or 0.0)) for track in candidates]
     min_popularity = min(popular_values, default=0.0)
     popularity_range = max(popular_values, default=0.0) - min_popularity
+    maximum_log_followers = max(
+        (log1p(profile.followers_count) for profile in similarity_features.values()),
+        default=0.0,
+    )
     scored: list[ScoredRecommendation[Track]] = []
 
     for track in candidates:
         artist_ids = track_artist_ids.get(track.id, [])
-        primary_artist_id = artist_ids[0] if artist_ids else None
-        if any(artist_id in hidden_artist_ids for artist_id in artist_ids):
+        inferred_artist_ids = _inferred_preferred_artist_ids(
+            track,
+            artist_names=artist_names,
+            preferred_artist_ids=set(positive_preferences),
+        )
+        scoring_artist_ids = list(dict.fromkeys([*inferred_artist_ids, *artist_ids]))
+        primary_artist_id = scoring_artist_ids[0] if scoring_artist_ids else None
+        if any(artist_id in hidden_artist_ids for artist_id in scoring_artist_ids):
             continue
-        artist_signal = max((normalized_preferences.get(item, 0.0) for item in artist_ids), default=0.0)
-        negative_artist_signal = max((negative_preferences.get(item, 0.0) for item in artist_ids), default=0.0)
-        genre_key = canonical_genre(track.genre) or "unknown"
-        genre_signal = normalized_genres.get(genre_key, 0.0)
+        artist_signal = max(
+            (normalized_preferences.get(item, 0.0) for item in scoring_artist_ids),
+            default=0.0,
+        )
+        negative_artist_signal = max(
+            (negative_preferences.get(item, 0.0) for item in scoring_artist_ids),
+            default=0.0,
+        )
+        track_genres, track_genre_families = _genre_features(track.genre)
+        genre_keys = track_genres | track_genre_families
+        genre_key = _primary_genre_key(track_genres, track_genre_families)
+        genre_signal = max((normalized_genres.get(item, 0.0) for item in genre_keys), default=0.0)
         similar_match = max(
             (similar_artists[item] for item in artist_ids if item in similar_artists),
             key=lambda item: item.score,
             default=None,
         )
         similar_signal = similar_match.score if similar_match is not None else 0.0
-        popularity_signal = (
+        collaborative_signal = (
+            similar_match.collaborative_score if similar_match is not None else 0.0
+        )
+        track_popularity_signal = (
             (max(0.0, float(track.popularity_score or 0.0)) - min_popularity) / popularity_range
             if popularity_range > 0
             else 0.0
         )
+        artist_reach_signal = max(
+            (
+                log1p(similarity_features[item].followers_count) / maximum_log_followers
+                for item in scoring_artist_ids
+                if item in similarity_features and maximum_log_followers > 0
+            ),
+            default=0.0,
+        )
+        artist_profile_signal = max(
+            (
+                similarity_features[item].profile_quality
+                for item in scoring_artist_ids
+                if item in similarity_features
+            ),
+            default=0.0,
+        )
+        popularity_signal = (
+            track_popularity_signal * 0.55
+            + artist_reach_signal * 0.30
+            + artist_profile_signal * 0.15
+        )
         exploration_signal = _stable_fraction(f"{user_id}", str(track.id))
         quality_signal = max(0.0, min(1.0, float(track.quality_score or 0.0) / 100.0))
+        freshness_signal = _freshness_score(track.created_at)
 
         score = (
             artist_signal * RECOMMENDATION_CONFIG.artist_score_weight
             + genre_signal * RECOMMENDATION_CONFIG.genre_score_weight
             + similar_signal * RECOMMENDATION_CONFIG.similar_score_weight
+            + freshness_signal * RECOMMENDATION_CONFIG.freshness_score_weight
             + popularity_signal * RECOMMENDATION_CONFIG.popularity_score_weight
+            + collaborative_signal * RECOMMENDATION_CONFIG.collaborative_score_weight
             + exploration_signal * RECOMMENDATION_CONFIG.exploration_score_weight
-            + quality_signal * 0.05
             - negative_artist_signal * RECOMMENDATION_CONFIG.negative_artist_score_weight
         )
+        # Quality is a confidence multiplier rather than an extra additive
+        # weight, keeping the documented score weights normalized.
+        score *= 0.85 + quality_signal * 0.15
         play_count = listened_counts.get(track.id, 0)
         repetition_penalty = min(0.30, play_count * 0.035)
         if track.id in recent_listened_ids:
@@ -356,7 +491,7 @@ def _score_candidates(
 
         recommendation_type, reason = _recommendation_label(
             personalization_active=personalization_active,
-            artist_ids=artist_ids,
+            artist_ids=scoring_artist_ids,
             explicit_artist_ids=explicit_artist_ids,
             explicit_artist_sources=explicit_artist_sources,
             artist_names=artist_names,
@@ -367,6 +502,7 @@ def _score_candidates(
                 similar_match.preferred_artist_id if similar_match is not None else None
             ),
             genre_signal=genre_signal,
+            genre_label=_display_genre(track.genre),
             popularity_signal=popularity_signal,
         )
         scored.append(
@@ -383,51 +519,396 @@ def _score_candidates(
     return scored
 
 
+def _load_artist_similarity_features(
+    db: Session,
+    *,
+    artist_ids: set[int],
+    current_user_id: int,
+) -> tuple[dict[int, _ArtistSimilarityFeatures], dict[int, set[int]]]:
+    """Load catalog, audience and co-preference evidence in bounded batches."""
+
+    resolved_ids = {int(item) for item in artist_ids if int(item) > 0}
+    if not resolved_ids:
+        return {}, {}
+
+    genres: dict[int, set[str]] = defaultdict(set)
+    genre_families: dict[int, set[str]] = defaultdict(set)
+    tags: dict[int, set[str]] = defaultdict(set)
+    listeners: dict[int, set[str]] = defaultdict(set)
+    preference_users: dict[int, set[int]] = defaultdict(set)
+    followers: dict[int, int] = defaultdict(int)
+    profile_quality: dict[int, float] = defaultdict(float)
+
+    for (
+        artist_id,
+        genres_json,
+        followers_count,
+        source_verified,
+        is_canonical,
+        confidence_score,
+        needs_review,
+    ) in db.execute(
+        select(
+            Artist.id,
+            Artist.genres_json,
+            Artist.source_followers_count,
+            Artist.source_verified,
+            Artist.is_canonical,
+            Artist.confidence_score,
+            Artist.needs_review,
+        ).where(Artist.id.in_(resolved_ids))
+    ).all():
+        followers[int(artist_id)] = max(0, int(followers_count or 0))
+        confidence = max(0.0, min(1.0, float(confidence_score or 0.0)))
+        profile_quality[int(artist_id)] = 0.0 if needs_review else min(
+            1.0,
+            confidence * 0.35
+            + float(bool(is_canonical)) * 0.45
+            + float(bool(source_verified)) * 0.20,
+        )
+        for raw_genre in _json_string_list(genres_json):
+            detailed, families = _genre_features(raw_genre)
+            genres[int(artist_id)].update(detailed)
+            genre_families[int(artist_id)].update(families)
+
+    relevant_track_ids: set[int] = set()
+    for artist_id, track_id, raw_genre, tags_json in db.execute(
+        select(TrackArtist.artist_id, Track.id, Track.genre, Track.tags_json)
+        .join(Track, Track.id == TrackArtist.track_id)
+        .where(
+            TrackArtist.artist_id.in_(resolved_ids),
+            Track.is_playable.is_(True),
+            Track.needs_review.is_(False),
+        )
+    ).all():
+        normalized_artist_id = int(artist_id)
+        relevant_track_ids.add(int(track_id))
+        detailed, families = _genre_features(raw_genre)
+        genres[normalized_artist_id].update(detailed)
+        genre_families[normalized_artist_id].update(families)
+        tags[normalized_artist_id].update(_tag_features(tags_json))
+
+    collaborations: dict[int, set[int]] = defaultdict(set)
+    if relevant_track_ids:
+        artists_by_track: dict[int, set[int]] = defaultdict(set)
+        ordered_track_ids = sorted(relevant_track_ids)
+        for offset in range(0, len(ordered_track_ids), 500):
+            track_id_batch = ordered_track_ids[offset : offset + 500]
+            for track_id, artist_id in db.execute(
+                select(TrackArtist.track_id, TrackArtist.artist_id).where(
+                    TrackArtist.track_id.in_(track_id_batch)
+                )
+            ).all():
+                artists_by_track[int(track_id)].add(int(artist_id))
+        for linked_artists in artists_by_track.values():
+            if len(linked_artists) < 2:
+                continue
+            for artist_id in linked_artists & resolved_ids:
+                collaborations[artist_id].update(linked_artists - {artist_id})
+
+    substantial = or_(
+        ListeningHistory.event_id.is_(None),
+        ListeningHistory.completed.is_(True),
+        ListeningHistory.completion_ratio >= RECOMMENDATION_CONFIG.substantial_ratio,
+    )
+    for artist_id, listener_id in db.execute(
+        select(ListeningHistory.artist_id, ListeningHistory.user_id)
+        .where(
+            ListeningHistory.artist_id.in_(resolved_ids),
+            ListeningHistory.skipped.is_(False),
+            substantial,
+        )
+        .distinct()
+    ).all():
+        if artist_id is not None and listener_id:
+            listeners[int(artist_id)].add(str(listener_id))
+
+    # Older history rows did not store artist_id. Resolve them through the
+    # existing track relation rather than discarding useful collaborative data.
+    for artist_id, listener_id in db.execute(
+        select(TrackArtist.artist_id, ListeningHistory.user_id)
+        .join(ListeningHistory, ListeningHistory.track_id == TrackArtist.track_id)
+        .where(
+            ListeningHistory.artist_id.is_(None),
+            TrackArtist.artist_id.in_(resolved_ids),
+            ListeningHistory.skipped.is_(False),
+            substantial,
+        )
+        .distinct()
+    ).all():
+        if listener_id:
+            listeners[int(artist_id)].add(str(listener_id))
+
+    for artist_id, preference_user_id in db.execute(
+        select(UserArtistPreference.artist_id, UserArtistPreference.user_id)
+        .where(
+            UserArtistPreference.artist_id.in_(resolved_ids),
+            UserArtistPreference.user_id != int(current_user_id),
+            UserArtistPreference.is_hidden.is_(False),
+            or_(
+                UserArtistPreference.explicit_selected.is_(True),
+                UserArtistPreference.weight > 0,
+            ),
+        )
+        .distinct()
+    ).all():
+        preference_users[int(artist_id)].add(int(preference_user_id))
+
+    features = {
+        artist_id: _ArtistSimilarityFeatures(
+            genres=frozenset(genres.get(artist_id, set())),
+            genre_families=frozenset(genre_families.get(artist_id, set())),
+            tags=frozenset(tags.get(artist_id, set())),
+            listeners=frozenset(listeners.get(artist_id, set())),
+            preference_users=frozenset(preference_users.get(artist_id, set())),
+            followers_count=followers.get(artist_id, 0),
+            profile_quality=profile_quality.get(artist_id, 0.0),
+        )
+        for artist_id in resolved_ids
+    }
+    return features, collaborations
+
+
 def _similar_artist_scores(
     *,
-    artist_genres: dict[int, set[str]],
+    features: dict[int, _ArtistSimilarityFeatures],
     collaborations: dict[int, set[int]],
-    artist_popularity_values: dict[int, list[float]],
-    preferred_artist_ids: set[int],
+    preferred_artist_weights: dict[int, float],
 ) -> dict[int, _SimilarArtistMatch]:
-    scores: dict[int, _SimilarArtistMatch] = {}
-    popularity = {
-        artist_id: sum(values) / len(values)
-        for artist_id, values in artist_popularity_values.items()
-        if values
-    }
-    maximum_popularity = max(popularity.values(), default=0.0)
+    """Return only similarities supported by more than provider popularity.
 
-    for candidate_id in set(artist_genres) | set(artist_popularity_values):
-        candidate_genres = artist_genres.get(candidate_id, set())
-        if candidate_id in preferred_artist_ids:
+    Missing components intentionally contribute zero. The previous algorithm
+    divided by the sum of whichever components happened to exist, so a lone
+    popularity match could become a 100% similarity claim.
+    """
+
+    scores: dict[int, _SimilarArtistMatch] = {}
+    preferred_ids = set(preferred_artist_weights)
+    minimum_score = max(0.0, min(1.0, RECOMMENDATION_CONFIG.similarity_min_score))
+
+    for candidate_id, candidate in features.items():
+        if candidate_id in preferred_ids:
             continue
-        best = 0.0
-        best_preferred_id: int | None = None
-        for preferred_id in sorted(preferred_artist_ids):
-            components: list[tuple[float, float]] = []
-            preferred_genres = artist_genres.get(preferred_id, set())
-            if candidate_genres and preferred_genres:
-                overlap = len(candidate_genres & preferred_genres) / len(candidate_genres | preferred_genres)
-                components.append((0.80, overlap))
-            if preferred_id in collaborations.get(candidate_id, set()):
-                components.append((0.15, 1.0))
-            if maximum_popularity > 0 and candidate_id in popularity and preferred_id in popularity:
-                compatibility = 1.0 - abs(popularity[candidate_id] - popularity[preferred_id]) / maximum_popularity
-                components.append((0.05, max(0.0, compatibility)))
-            if not components:
+        best_match: _SimilarArtistMatch | None = None
+        for preferred_id, raw_anchor_weight in sorted(preferred_artist_weights.items()):
+            preferred = features.get(preferred_id)
+            if preferred is None:
                 continue
-            available_weight = sum(weight for weight, _ in components)
-            similarity = sum(weight * value for weight, value in components) / available_weight
-            if similarity > best:
-                best = similarity
-                best_preferred_id = preferred_id
-        if best > 0 and best_preferred_id is not None:
-            scores[candidate_id] = _SimilarArtistMatch(
-                score=min(1.0, best),
-                preferred_artist_id=best_preferred_id,
+
+            genre_similarity = _jaccard(candidate.genres, preferred.genres)
+            family_similarity = _jaccard(
+                candidate.genre_families,
+                preferred.genre_families,
             )
+            tag_similarity = _cosine_set_similarity(candidate.tags, preferred.tags)
+            audience_similarity = _shrunk_set_similarity(
+                candidate.listeners,
+                preferred.listeners,
+            )
+            co_preference_similarity = _shrunk_set_similarity(
+                candidate.preference_users,
+                preferred.preference_users,
+            )
+            collaboration_similarity = float(
+                preferred_id in collaborations.get(candidate_id, set())
+            )
+            popularity_similarity = _popularity_compatibility(
+                candidate.followers_count,
+                preferred.followers_count,
+            )
+
+            has_meaningful_evidence = any(
+                value > 0
+                for value in (
+                    genre_similarity,
+                    family_similarity,
+                    tag_similarity,
+                    audience_similarity,
+                    co_preference_similarity,
+                    collaboration_similarity,
+                )
+            )
+            if not has_meaningful_evidence:
+                continue
+
+            similarity = (
+                genre_similarity * RECOMMENDATION_CONFIG.similarity_genre_weight
+                + family_similarity * RECOMMENDATION_CONFIG.similarity_genre_family_weight
+                + tag_similarity * RECOMMENDATION_CONFIG.similarity_tag_weight
+                + audience_similarity * RECOMMENDATION_CONFIG.similarity_audience_weight
+                + co_preference_similarity
+                * RECOMMENDATION_CONFIG.similarity_co_preference_weight
+                + collaboration_similarity
+                * RECOMMENDATION_CONFIG.similarity_collaboration_weight
+                + popularity_similarity
+                * RECOMMENDATION_CONFIG.similarity_popularity_weight
+            )
+            anchor_weight = max(0.0, min(1.0, float(raw_anchor_weight)))
+            similarity *= 0.65 + anchor_weight * 0.35
+            if collaboration_similarity > 0:
+                similarity = max(similarity, 0.50 * (0.65 + anchor_weight * 0.35))
+
+            collaborative_score = max(
+                audience_similarity,
+                co_preference_similarity,
+                collaboration_similarity,
+            )
+            match = _SimilarArtistMatch(
+                score=min(1.0, similarity),
+                preferred_artist_id=preferred_id,
+                collaborative_score=collaborative_score,
+            )
+            if match.score >= minimum_score and (
+                best_match is None or match.score > best_match.score
+            ):
+                best_match = match
+        if best_match is not None:
+            scores[candidate_id] = best_match
     return scores
+
+
+def _json_string_list(raw: str | None) -> list[str]:
+    try:
+        value = json.loads(raw or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _normalize_feature_text(value: str | None) -> str:
+    cleaned = str(value or "").strip().lower().replace("ё", "е").replace("_", " ")
+    return " ".join(re.sub(r"[^\w]+", " ", cleaned, flags=re.UNICODE).split())
+
+
+def _genre_features(value: str | None) -> tuple[set[str], set[str]]:
+    cleaned = _normalize_feature_text(value)
+    if (
+        not cleaned
+        or cleaned in _INVALID_GENRES
+        or cleaned.isdigit()
+        or cleaned.startswith(("http ", "https ", "www "))
+        or len(cleaned) > 64
+    ):
+        return set(), set()
+
+    padded = f" {cleaned} "
+    for alias, detailed, family in _GENRE_ALIASES:
+        if cleaned == alias or f" {alias} " in padded:
+            return {f"genre:{detailed}"}, {f"family:{family}"}
+    return {f"genre:{cleaned.replace(' ', '-')}"}, set()
+
+
+def _tag_features(raw: str | None) -> set[str]:
+    result: set[str] = set()
+    for item in _json_string_list(raw):
+        cleaned = _normalize_feature_text(item)
+        if (
+            not cleaned
+            or cleaned in _GENERIC_TAGS
+            or cleaned.isdigit()
+            or len(cleaned) < 3
+            or len(cleaned) > 64
+            or cleaned.startswith(("http ", "https ", "www "))
+        ):
+            continue
+        result.add(cleaned)
+        for token in cleaned.split():
+            if len(token) >= 3 and token not in _GENERIC_TAGS and not token.isdigit():
+                result.add(token)
+    return result
+
+
+def _inferred_preferred_artist_ids(
+    track: Track,
+    *,
+    artist_names: dict[int, str],
+    preferred_artist_ids: set[int],
+) -> list[int]:
+    """Recognize selected artists credited in trusted catalog text metadata.
+
+    Some provider rows are linked to the uploader while the title/tags carry
+    the canonical performing artist. Treat those tracks as direct selections
+    so the UI never says "Kai Angel sounds like Kai Angel".
+    """
+
+    title = f" {_normalize_feature_text(track.title)} "
+    track_tags = _tag_features(track.tags_json)
+    inferred: list[int] = []
+    for artist_id in sorted(preferred_artist_ids):
+        raw_name = artist_names.get(artist_id, "")
+        variants = {
+            _normalize_feature_text(raw_name),
+            _normalize_feature_text(re.split(r"\s*\(@?", raw_name, maxsplit=1)[0]),
+        }
+        matched = False
+        for variant in {item for item in variants if item}:
+            if variant in track_tags:
+                matched = True
+                break
+            if len(variant) >= 4 and f" {variant} " in title:
+                matched = True
+                break
+        if matched:
+            inferred.append(artist_id)
+    return inferred
+
+
+def _primary_genre_key(genres: set[str], families: set[str]) -> str:
+    if genres:
+        return sorted(genres)[0]
+    if families:
+        return sorted(families)[0]
+    return "unknown"
+
+
+def _display_genre(value: str | None) -> str | None:
+    raw = " ".join(str(value or "").strip().split())
+    detailed, families = _genre_features(raw)
+    if not raw or not (detailed or families) or len(raw) > 48:
+        return None
+    return raw
+
+
+def _jaccard(left: frozenset[str], right: frozenset[str]) -> float:
+    if not left or not right:
+        return 0.0
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+def _cosine_set_similarity(left: frozenset, right: frozenset) -> float:
+    if not left or not right:
+        return 0.0
+    overlap = len(left & right)
+    if overlap <= 0:
+        return 0.0
+    return overlap / sqrt(len(left) * len(right))
+
+
+def _shrunk_set_similarity(left: frozenset, right: frozenset) -> float:
+    overlap = len(left & right)
+    if overlap <= 0:
+        return 0.0
+    # One shared listener is useful but not enough to dominate the feed.
+    support = overlap / (overlap + 2.0)
+    return _cosine_set_similarity(left, right) * support
+
+
+def _popularity_compatibility(left_followers: int, right_followers: int) -> float:
+    if left_followers <= 0 or right_followers <= 0:
+        return 0.0
+    distance = abs(log1p(left_followers) - log1p(right_followers))
+    return exp(-distance / 3.0)
+
+
+def _freshness_score(created_at: datetime | None) -> float:
+    if created_at is None:
+        return 0.0
+    now = datetime.now(timezone.utc) if created_at.tzinfo else datetime.utcnow()
+    age_days = max(0.0, (now - created_at).total_seconds() / 86_400)
+    return exp(-age_days / 365.0)
 
 
 def _history_signals(db: Session, *, user_id: int) -> tuple[dict[int, int], set[int], dict[int, int]]:
@@ -499,6 +980,7 @@ def _recommendation_label(
     similar_signal: float,
     similar_reference_artist_id: int | None,
     genre_signal: float,
+    genre_label: str | None,
     popularity_signal: float,
 ) -> tuple[str, str]:
     if not personalization_active:
@@ -533,6 +1015,8 @@ def _recommendation_label(
             return "similar", f"Похоже на {reference_artist_name} - по вашим предпочтениям"
         return "similar", "Похоже на любимых артистов"
     if genre_signal > 0:
+        if genre_label:
+            return "genre", f"В жанре «{genre_label}» - по вашим предпочтениям"
         return "genre", "В жанрах, которые вам нравятся"
     if popularity_signal >= 0.45:
         return "popular", "Популярно и подходит вашему вкусу"

@@ -32,6 +32,7 @@ from app.services.artist_cleanup_service import (
 )
 from app.services.cover_service import extract_cover_url, fetch_soundcloud_oembed_cover
 from app.services.normalization_service import clean_display_artist_name, detect_artist_region, normalize_name, normalize_title
+from app.services.popular_ranking_service import PROVIDER_POPULARITY_TAG, provider_popularity_score
 from app.services.serialization_service import track_to_read
 from app.services.soundcloud_profile_service import fetch_soundcloud_profile
 from app.services.proxy_rotator import proxy_rotator
@@ -582,6 +583,10 @@ def _query_tag(query: str) -> str | None:
 
 def _ensure_query_tag(track, query: str) -> bool:
     tag = _query_tag(query)
+    return _ensure_track_tag(track, tag)
+
+
+def _ensure_track_tag(track, tag: str | None) -> bool:
     if not tag:
         return False
     try:
@@ -608,6 +613,13 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
     if artist_name and len(_query_tokens(query)) > 1 and normalized_raw_artist.startswith(normalized_query):
         artist_name = clean_display_artist_name(query)
     provider_name = str(provider["name"])
+    provider_score, provider_score_reliable = provider_popularity_score(
+        view_count=result.get("view_count"),
+        like_count=result.get("like_count"),
+        repost_count=result.get("repost_count"),
+        timestamp=result.get("timestamp"),
+        fallback=float(provider["popularity_score"]),
+    )
     source_url = _candidate_source_url(provider_name, result)
     cover_url = extract_cover_url(result, provider_name=provider_name)
     if not cover_url and provider_name == "soundcloud":
@@ -640,6 +652,11 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
     existing = find_track_by_provider_external_id(db, provider=provider_name, external_id=external_id)
     if existing:
         changed = _canonicalize_catalog_track_source(existing)
+        if provider_score_reliable and abs(float(existing.popularity_score or 0.0) - provider_score) >= 0.001:
+            existing.popularity_score = provider_score
+            changed = True
+        if provider_score_reliable and _ensure_track_tag(existing, PROVIDER_POPULARITY_TAG):
+            changed = True
         if profile_artist is not None:
             ensure_track_artist_link(
                 db,
@@ -700,6 +717,15 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
         duration_seconds=duration_seconds,
     )
     if duplicate:
+        popularity_changed = provider_score_reliable and abs(
+            float(duplicate.popularity_score or 0.0) - provider_score
+        ) >= 0.001
+        if popularity_changed:
+            duplicate.popularity_score = provider_score
+        popularity_tag_changed = provider_score_reliable and _ensure_track_tag(
+            duplicate,
+            PROVIDER_POPULARITY_TAG,
+        )
         if not duplicate.is_playable or not _is_known_provider_source(duplicate.source_name, duplicate.source_url):
             duplicate.is_playable = True
             duplicate.source_name = provider_name
@@ -712,6 +738,10 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
             db.commit()
         else:
             changed = _canonicalize_catalog_track_source(duplicate)
+            if popularity_changed:
+                changed = True
+            if popularity_tag_changed:
+                changed = True
             if cover_url and not duplicate.cover_url:
                 duplicate.cover_url = cover_url
                 changed = True
@@ -755,9 +785,14 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
         duration_seconds=duration_seconds,
         cover_url=cover_url,
         genre=result.get("genre") or None,
-        tags=["provider", str(provider["tag"]), *([_query_tag(query)] if _query_tag(query) else [])],
+        tags=[
+            "provider",
+            str(provider["tag"]),
+            *([PROVIDER_POPULARITY_TAG] if provider_score_reliable else []),
+            *([_query_tag(query)] if _query_tag(query) else []),
+        ],
         region=detect_artist_region(artist_name),
-        popularity_score=float(provider["popularity_score"]),
+        popularity_score=provider_score,
         quality_score=100.0,
         is_playable=True,
         audio_src=None,

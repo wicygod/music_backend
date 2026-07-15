@@ -18,6 +18,7 @@ from app.models.playlist import UserFavorite, UserPlaylist, UserPlaylistTrack
 from app.models.personalization import RecommendationEvent, UserArtistPreference
 from app.models.track import Track, TrackArtist
 from app.models.user import BlockedUser, User
+from app.repositories.tracks import list_trending_rankings, popular_ranking_payload
 from app.schemas.auth import BanRequest
 from app.services.admin_monitor import activity_snapshot, recent_events, record_event, system_stats
 from app.services.auth_service import hash_password, user_to_read
@@ -26,6 +27,7 @@ from app.services.performance_metrics import performance_metrics
 
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+_chart_cache: dict[str, object] = {"expires_at": 0.0, "items": []}
 
 
 class AdminUserUpdate(BaseModel):
@@ -51,7 +53,11 @@ def require_admin_key(x_admin_key: str | None = Header(None, alias="X-Admin-Key"
 
 def _top_tracks(db: Session, limit: int = 10) -> list[dict]:
     stmt = (
-        select(Track, func.sum(ListeningHistory.play_count).label("play_count"))
+        select(
+            Track,
+            func.sum(ListeningHistory.play_count).label("play_count"),
+            func.count(func.distinct(ListeningHistory.user_id)).label("unique_listeners"),
+        )
         .join(ListeningHistory, ListeningHistory.track_id == Track.id)
         .where(ListeningHistory.event_id.is_(None))
         .options(selectinload(Track.artist_links).selectinload(TrackArtist.artist))
@@ -64,9 +70,28 @@ def _top_tracks(db: Session, limit: int = 10) -> list[dict]:
         {
             "track": track_to_read(track).model_dump(mode="json"),
             "play_count": int(play_count),
+            "unique_listeners": int(unique_listeners),
+            "repeat_plays": max(0, int(play_count) - int(unique_listeners)),
         }
-        for track, play_count in rows
+        for track, play_count, unique_listeners in rows
     ]
+
+
+def _chart_tracks(db: Session, limit: int = 10) -> list[dict]:
+    now = time.monotonic()
+    cached = _chart_cache.get("items")
+    if now < float(_chart_cache.get("expires_at") or 0.0) and isinstance(cached, list):
+        return cached[:limit]
+
+    rankings = list_trending_rankings(db, limit=max(10, limit), rotation_key="global")
+    items: list[dict] = []
+    for position, candidate in enumerate(rankings, start=1):
+        payload = popular_ranking_payload(candidate, position)
+        payload["track"] = track_to_read(candidate.item).model_dump(mode="json")
+        items.append(payload)
+    _chart_cache["items"] = items
+    _chart_cache["expires_at"] = now + 60.0
+    return items[:limit]
 
 
 def _user_scope(user_id: int) -> str:
@@ -247,6 +272,7 @@ def _prune_audio_cache(max_age_hours: int) -> tuple[int, int]:
 def admin_stats(db: Session = Depends(get_db)) -> dict:
     stats = system_stats()
     stats["top_tracks"] = _top_tracks(db, limit=10)
+    stats["chart_tracks"] = _chart_tracks(db, limit=10)
     stats["total_users"] = int(db.execute(select(func.count(User.id))).scalar() or 0)
     stats["total_plays"] = int(
         db.execute(

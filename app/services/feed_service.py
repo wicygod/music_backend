@@ -4,11 +4,12 @@ from app.repositories.history import list_recent_history_tracks
 from app.repositories.tracks import (
     list_random_tracks,
     list_region_tracks,
-    list_trending_tracks,
+    list_trending_rankings,
 )
 from app.schemas.feed import HomeFeed
 from app.services.recommendation_config import RECOMMENDATION_CONFIG
 from app.services.recommendation_service import get_personalized_recommendations
+from app.services.popular_ranking_service import POPULAR_ALGORITHM_VERSION
 from app.services.serialization_service import track_to_read
 from app.services.track_filter_service import dedupe_tracks
 
@@ -28,13 +29,14 @@ def get_home_feed(db: Session, user_id: str = "local") -> HomeFeed:
         for item in (recommendation_result.items if recommendation_result else [])
         if item.track.id not in recent_ids
     ]
-    trending = dedupe_tracks(
-        list_trending_tracks(
-            db,
-            limit=48,
-            rotation_key=user_id,
-            excluded_song_keys=seen_keys,
-        ),
+    popular_rankings = list_trending_rankings(
+        db,
+        limit=48,
+        rotation_key="global",
+        excluded_song_keys=seen_keys,
+    )
+    popular = dedupe_tracks(
+        [candidate.item for candidate in popular_rankings],
         limit=48,
         seen_keys=seen_keys,
     )
@@ -44,12 +46,15 @@ def get_home_feed(db: Session, user_id: str = "local") -> HomeFeed:
     return HomeFeed(
         recent=[track_to_read(track) for track in recent],
         random=[track_to_read(track) for track in random],
-        trending=[track_to_read(track) for track in trending],
+        trending=[track_to_read(track) for track in popular],
+        top=[track_to_read(track) for track in popular],
         ru=[track_to_read(track) for track in ru],
         global_=[track_to_read(track) for track in global_tracks],
         personalized=personalized,
         personalization_active=bool(recommendation_result and recommendation_result.personalization_active),
         algorithm_version=RECOMMENDATION_CONFIG.algorithm_version,
+        popular_algorithm_version=POPULAR_ALGORITHM_VERSION,
+        popular_window_days=14,
     )
 
 

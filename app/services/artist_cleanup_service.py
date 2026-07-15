@@ -26,16 +26,18 @@ POPULAR_BRACKET_RE = re.compile(
 POPULAR_VARIANT_RE = re.compile(
     r"\b("
     r"sped\s*up|speed\s*up|speedup|spedup|slowed|slow\s*\+\s*reverb|slowed\s*\+\s*reverb|"
-    r"reverb|8d|nightcore|remix|edit|bootleg|mashup|bass\s*boost(?:ed)?|visualizer|lyrics?|"
-    r"breakcore|cover|\u043a\u0430\u0432\u0435\u0440|snippet|preview|demo|ai|mylancore|instrumental|karaoke"
+    r"reverb|8d|nightcore|hardstyle|remix|rmx|mix|edit|bootleg|mashup|bass\s*boost(?:ed)?|visualizer|lyrics?|"
+    r"breakcore|cover|\u043a\u0430\u0432\u0435\u0440|snippet|preview|demo|ai|mylancore|instrumental|karaoke|version|\u0432\u0435\u0440\u0441\u0438\u044f|"
+    r"intro|outro|\u0438\u043d\u0442\u0440\u043e|\u0430\u0443\u0442\u0440\u043e"
     r")\b",
     re.IGNORECASE,
 )
 POPULAR_TRAILING_VARIANT_RE = re.compile(
     r"\b("
-    r"sped\s*up|speed\s*up|speedup|spedup|slowed|reverb|8d|nightcore|remix|edit|"
-    r"bootleg|mashup|breakcore|cover|\u043a\u0430\u0432\u0435\u0440|snippet|preview|demo|ai|"
-    r"mylancore|instrumental|karaoke|bass\s*boost(?:ed)?"
+    r"sped\s*up|speed\s*up|speedup|spedup|slowed|reverb|8d|nightcore|hardstyle|remix|rmx|mix|edit|"
+    r"bootleg|mashup|breakcore|cover|\u043a\u0430\u0432\u0435\u0440|snippet|preview|demo|ai|version|\u0432\u0435\u0440\u0441\u0438\u044f|"
+    r"mylancore|instrumental|karaoke|bass\s*boost(?:ed)?|intro|outro|"
+    r"\u0438\u043d\u0442\u0440\u043e|\u0430\u0443\u0442\u0440\u043e"
     r")\b.*$",
     re.IGNORECASE,
 )
@@ -155,6 +157,17 @@ def has_clean_artist_signal(title: str | None, artist: str | None, source_url: s
     if source_profile_matches_artist(source_url, artist):
         return True
     return is_trusted_music_uploader(artist)
+
+
+def is_low_value_popular_variant(title: str | None) -> bool:
+    """Return variants that should need unusually strong chart evidence.
+
+    They are not deleted from search or a user's library.  The public chart is
+    simply conservative about slowed/reverb, bass-boosted, demos, AI covers and
+    similar reuploads unless provider or listener signals prove real demand.
+    """
+
+    return bool(POPULAR_BRACKET_RE.search(title or "") or POPULAR_VARIANT_RE.search(title or ""))
 
 
 def popular_track_key(title: str | None, artist: str | None = None) -> str:

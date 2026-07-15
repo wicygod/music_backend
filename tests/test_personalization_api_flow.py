@@ -114,7 +114,7 @@ def test_registration_onboarding_feed_and_listening_event_work_as_one_api_flow()
         home = client.get("/api/feed/home", headers=headers)
         assert home.status_code == 200
         assert home.json()["personalization_active"] is True
-        assert home.json()["algorithm_version"] == "personalized-v1"
+        assert home.json()["algorithm_version"] == "personalized-v2"
         assert home.json()["personalized"]
 
         track_id = catalog[0][1].id
@@ -135,7 +135,7 @@ def test_registration_onboarding_feed_and_listening_event_work_as_one_api_flow()
                 "context": "home",
                 "recommendationType": "selected",
                 "recommendationReason": "From onboarding",
-                "algorithmVersion": "personalized-v1",
+                "algorithmVersion": "personalized-v2",
             },
         )
         assert detailed.status_code == 200

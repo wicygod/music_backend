@@ -2,6 +2,7 @@ import argparse
 import sys
 
 from app.database import SessionLocal, init_db
+from app.repositories.tracks import list_trending_rankings
 from app.services.import_service import load_artist_seed, load_demo_seed
 from app.services.job_processor_service import (
     get_coverage_summary,
@@ -17,6 +18,7 @@ from app.services.reporting_service import (
     export_import_report,
     export_tracks_needs_review,
 )
+from app.services.provider_popularity_refresh_service import refresh_provider_popularity
 
 
 def main() -> None:
@@ -50,6 +52,23 @@ def main() -> None:
     subparsers.add_parser("export-import-report", help="Export coverage and import job reports")
     subparsers.add_parser("export-artists-without-tracks", help="Export artists without tracks")
     subparsers.add_parser("export-tracks-needs-review", help="Export tracks marked needs_review")
+    popularity_parser = subparsers.add_parser(
+        "refresh-track-popularity",
+        help="Refresh real provider popularity for a bounded legacy batch",
+    )
+    popularity_parser.add_argument("--limit", type=int, default=20)
+    popularity_parser.add_argument(
+        "--after-id",
+        type=int,
+        default=0,
+        help="Continue after this track id so unavailable rows do not block later batches",
+    )
+    popularity_parser.add_argument("--dry-run", action="store_true")
+    popularity_parser.add_argument(
+        "--chart-only",
+        action="store_true",
+        help="Refresh only the current public-chart candidates (up to 120)",
+    )
     args = parser.parse_args()
 
     init_db()
@@ -179,6 +198,42 @@ def main() -> None:
         with SessionLocal() as db:
             paths = export_tracks_needs_review(db)
         _print_paths(paths)
+        return
+
+    if args.command == "refresh-track-popularity":
+        with SessionLocal() as db:
+            chart_track_ids = None
+            if args.chart_only:
+                chart_track_ids = [
+                    candidate.item.id
+                    for candidate in list_trending_rankings(
+                        db,
+                        limit=min(max(1, args.limit), 120),
+                        rotation_key="provider-refresh",
+                    )
+                ]
+            result = refresh_provider_popularity(
+                db,
+                limit=args.limit,
+                after_id=args.after_id,
+                dry_run=args.dry_run,
+                track_ids=chart_track_ids,
+            )
+        print("Provider popularity refresh:")
+        for key in (
+            "dry_run",
+            "scanned",
+            "updated",
+            "unchanged",
+            "unavailable",
+            "failed",
+            "last_track_id",
+        ):
+            print(f"- {key}: {getattr(result, key)}")
+        if result.errors:
+            print("- errors:")
+            for error in result.errors:
+                print(f"  - {error}")
         return
 
 

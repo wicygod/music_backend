@@ -37,5 +37,9 @@ def test_admin_top_tracks_sums_repeat_plays_across_listeners() -> None:
             ("Repeated", 7),
             ("Single", 2),
         ]
+        assert top[0]["unique_listeners"] == 2
+        assert top[0]["repeat_plays"] == 5
+        assert top[1]["unique_listeners"] == 1
+        assert top[1]["repeat_plays"] == 1
 
     engine.dispose()

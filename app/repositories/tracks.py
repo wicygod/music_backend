@@ -1,20 +1,30 @@
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models.artist import Artist
+from app.models.history import ListeningHistory
+from app.models.playlist import UserFavorite, UserPlaylist, UserPlaylistTrack
 from app.models.track import Track, TrackArtist
 from app.schemas.track import TrackSeedCreate
 from app.services.artist_cleanup_service import (
     artist_from_title,
     has_clean_artist_signal,
+    is_low_value_popular_variant,
     popular_track_key,
     primary_artist_segment,
 )
 from app.services.normalization_service import normalize_name, normalize_title, normalize_track_title_for_dedupe
-from app.services.popular_ranking_service import PopularCandidate, rank_popular_candidates
+from app.services.popular_ranking_service import (
+    POPULAR_RANKING_CONFIG,
+    PROVIDER_POPULARITY_TAG,
+    PopularCandidate,
+    is_popular_candidate_eligible,
+    popular_candidate_score,
+    rank_popular_candidates,
+)
 
 
 TOP_PRIORITY_ARTISTS = tuple(
@@ -37,6 +47,9 @@ RARE_MIX_ARTISTS = tuple(normalize_name(name) for name in ("tuborosho", "anonymo
 POPULAR_POOL_SCAN_LIMIT = 2200
 POPULAR_POOL_TARGET = 400
 POPULAR_POOL_PER_ARTIST_LIMIT = 12
+POPULAR_MIN_DURATION_SECONDS = 45
+POPULAR_MAX_DURATION_SECONDS = 12 * 60
+POPULAR_UNKNOWN_PROVIDER_SCORES = {50.0, 65.0, 75.0}
 POPULAR_BLOCKED_PHRASES = (
     "home loan",
     "loan",
@@ -215,6 +228,23 @@ def list_trending_tracks(
     rotation_key: str = "local",
     excluded_song_keys: set[str] | None = None,
 ) -> list[Track]:
+    return [
+        candidate.item
+        for candidate in list_trending_rankings(
+            db,
+            limit=limit,
+            rotation_key=rotation_key,
+            excluded_song_keys=excluded_song_keys,
+        )
+    ]
+
+
+def list_trending_rankings(
+    db: Session,
+    limit: int = 12,
+    rotation_key: str = "local",
+    excluded_song_keys: set[str] | None = None,
+) -> list[PopularCandidate[Track]]:
     requested_limit = max(1, min(int(limit), 120))
     stmt = (
         with_artists(filtered_feed_stmt())
@@ -229,21 +259,26 @@ def list_trending_tracks(
     )
     candidates = list(db.execute(stmt).scalars().unique().all())
 
-    popular_candidates: list[PopularCandidate[Track]] = []
+    canonical_by_name = _canonical_popular_artist_index(db)
+    preliminary: list[tuple[Track, Artist, str, str]] = []
     seen_song_keys: set[str] = set()
-    pool_artist_counts: dict[str, int] = {}
     duplicates_skipped = 0
     dirty_skipped = 0
-    artist_cap_skipped = 0
+    authority_skipped = 0
 
     for track in candidates:
-        artist = _primary_artist_name(track)
-        priority_artist = _priority_artist_from_text(track.title, artist)
-        display_artist = priority_artist or artist_from_title(track.title) or artist
+        if not _popular_track_quality_eligible(track):
+            dirty_skipped += 1
+            continue
+        authority = _effective_popular_artist(track, canonical_by_name)
+        if authority is None:
+            authority_skipped += 1
+            continue
+        display_artist = authority.name
         if _is_blocked_popular_candidate(track.title, display_artist):
             dirty_skipped += 1
             continue
-        if not display_artist or not (priority_artist or has_clean_artist_signal(track.title, display_artist, track.source_url)):
+        if not has_clean_artist_signal(track.title, display_artist, track.source_url):
             dirty_skipped += 1
             continue
 
@@ -253,27 +288,57 @@ def list_trending_tracks(
             continue
         if excluded_song_keys and song_key in excluded_song_keys:
             continue
+        preliminary.append((track, authority, song_key, normalize_name(authority.name) or "unknown"))
+
+    signal_maps = _popular_signal_maps(
+        db,
+        [track.id for track, _authority, _song_key, _artist_key in preliminary],
+    )
+
+    popular_candidates: list[PopularCandidate[Track]] = []
+    pool_artist_counts: dict[str, int] = {}
+    artist_cap_skipped = 0
+    evidence_skipped = 0
+
+    for track, authority, song_key, artist_key in preliminary:
+        stats = signal_maps.get(track.id, {})
+        if pool_artist_counts.get(artist_key, 0) >= POPULAR_POOL_PER_ARTIST_LIMIT:
+            artist_cap_skipped += 1
+            continue
+        candidate = PopularCandidate(
+            item=track,
+            stable_key=str(track.id),
+            artist_key=artist_key,
+            genre_key=_popular_genre_key(track),
+            region_key=normalize_name(track.region or "unknown") or "unknown",
+            popularity_score=float(track.popularity_score or 0.0),
+            quality_score=float(track.quality_score or 0.0),
+            provider_signal_reliable=_provider_popularity_is_reliable(track),
+            artist_followers=max(0, int(authority.source_followers_count or 0)),
+            artist_verified=bool(authority.source_verified),
+            artist_canonical=bool(authority.is_canonical and not authority.needs_review),
+            unique_listeners=int(stats.get("unique_listeners", 0)),
+            capped_plays=int(stats.get("capped_plays", 0)),
+            recent_plays=int(stats.get("recent_plays", 0)),
+            detailed_plays=int(stats.get("detailed_plays", 0)),
+            completed_plays=int(stats.get("completed_plays", 0)),
+            skipped_plays=int(stats.get("skipped_plays", 0)),
+            favorite_count=int(stats.get("favorite_count", 0)),
+            playlist_add_count=int(stats.get("playlist_add_count", 0)),
+            low_value_variant=is_low_value_popular_variant(track.title),
+        )
+        if not is_popular_candidate_eligible(candidate):
+            evidence_skipped += 1
+            continue
+        # Only an eligible candidate may reserve the normalized song key.
+        # Otherwise a rejected slowed/remix reupload scanned first could hide
+        # the clean original from the chart.
         if song_key in seen_song_keys:
             duplicates_skipped += 1
             continue
         seen_song_keys.add(song_key)
-
-        artist_key = _popular_artist_key(track)
-        if pool_artist_counts.get(artist_key, 0) >= POPULAR_POOL_PER_ARTIST_LIMIT:
-            artist_cap_skipped += 1
-            continue
         pool_artist_counts[artist_key] = pool_artist_counts.get(artist_key, 0) + 1
-        popular_candidates.append(
-            PopularCandidate(
-                item=track,
-                stable_key=str(track.id),
-                artist_key=artist_key,
-                genre_key=_popular_genre_key(track),
-                region_key=normalize_name(track.region or "unknown") or "unknown",
-                popularity_score=track.popularity_score,
-                quality_score=track.quality_score,
-            )
-        )
+        popular_candidates.append(candidate)
 
         if len(popular_candidates) >= POPULAR_POOL_TARGET:
             break
@@ -295,10 +360,200 @@ def list_trending_tracks(
         f"head_unique_artists={len(head_artist_counts)} "
         f"head_max_per_artist={max(head_artist_counts.values(), default=0)} "
         f"duplicates_skipped={duplicates_skipped} dirty_skipped={dirty_skipped} "
+        f"authority_skipped={authority_skipped} evidence_skipped={evidence_skipped} "
         f"artist_cap_skipped={artist_cap_skipped}",
         flush=True,
     )
-    return selected
+    return ranked
+
+
+def popular_ranking_payload(candidate: PopularCandidate[Track], position: int) -> dict:
+    """Expose explainable chart metrics to the authenticated admin app."""
+
+    detailed = max(0, int(candidate.detailed_plays or 0))
+    completion_rate = candidate.completed_plays / detailed if detailed else None
+    skip_rate = candidate.skipped_plays / detailed if detailed else None
+    return {
+        "track": candidate.item,
+        "position": max(1, int(position)),
+        "score": popular_candidate_score(candidate),
+        "algorithm_version": "popular-v2",
+        "provider_score": float(candidate.popularity_score or 0.0),
+        "provider_signal_reliable": bool(candidate.provider_signal_reliable),
+        "artist_followers": max(0, int(candidate.artist_followers or 0)),
+        "artist_verified": bool(candidate.artist_verified),
+        "unique_listeners": max(0, int(candidate.unique_listeners or 0)),
+        "play_count": max(0, int(candidate.capped_plays or 0)),
+        "repeat_plays": max(0, int(candidate.capped_plays or 0) - int(candidate.unique_listeners or 0)),
+        "recent_plays": max(0, int(candidate.recent_plays or 0)),
+        "completion_rate": round(completion_rate, 4) if completion_rate is not None else None,
+        "skip_rate": round(skip_rate, 4) if skip_rate is not None else None,
+        "favorite_count": max(0, int(candidate.favorite_count or 0)),
+        "playlist_add_count": max(0, int(candidate.playlist_add_count or 0)),
+    }
+
+
+def _canonical_popular_artist_index(db: Session) -> dict[str, Artist]:
+    profiles = list(
+        db.execute(
+            select(Artist).where(
+                Artist.is_canonical == True,
+                Artist.needs_review == False,
+            )
+        ).scalars().all()
+    )
+    result: dict[str, Artist] = {}
+    for artist in profiles:
+        key = normalize_name(artist.normalized_name or artist.name)
+        if not key:
+            continue
+        current = result.get(key)
+        if current is None or _canonical_artist_strength(artist) > _canonical_artist_strength(current):
+            result[key] = artist
+    return result
+
+
+def _canonical_artist_strength(artist: Artist) -> tuple[bool, int, float, int]:
+    return (
+        bool(artist.source_verified),
+        max(0, int(artist.source_followers_count or 0)),
+        float(artist.popularity_score or 0.0),
+        -int(artist.id or 0),
+    )
+
+
+def _effective_popular_artist(track: Track, canonical_by_name: dict[str, Artist]) -> Artist | None:
+    parsed_artist = artist_from_title(track.title)
+    parsed_candidates = [parsed_artist, primary_artist_segment(parsed_artist)] if parsed_artist else []
+    for name in parsed_candidates:
+        key = normalize_name(name or "")
+        if key and key in canonical_by_name:
+            return canonical_by_name[key]
+
+    # An explicit, unresolved artist prefix is stronger evidence than the
+    # uploader link.  Do not let an unrelated canonical compilation/reupload
+    # profile lend its authority to the named artist in the title.
+    if parsed_artist:
+        return None
+
+    # A canonical uploader link must not make an unrelated reupload official.
+    # Only the declared main artist is used when the title carries no exact
+    # artist prefix.  Duplicate canonical profiles are resolved by reach.
+    linked = [
+        link.artist
+        for link in track.artist_links
+        if link.role == "main"
+        and link.artist
+        and link.artist.is_canonical
+        and not link.artist.needs_review
+    ]
+    return max(linked, key=_canonical_artist_strength) if linked else None
+
+
+def _popular_track_quality_eligible(track: Track) -> bool:
+    duration = max(0, int(track.duration_seconds or 0))
+    return bool(
+        track.is_playable
+        and not track.needs_review
+        and float(track.quality_score or 0.0) >= 70.0
+        and POPULAR_MIN_DURATION_SECONDS <= duration <= POPULAR_MAX_DURATION_SECONDS
+    )
+
+
+def _provider_popularity_is_reliable(track: Track) -> bool:
+    try:
+        tags = json.loads(track.tags_json or "[]")
+    except (json.JSONDecodeError, TypeError):
+        tags = []
+    if isinstance(tags, list) and PROVIDER_POPULARITY_TAG in {str(tag) for tag in tags}:
+        return True
+    score = round(float(track.popularity_score or 0.0), 3)
+    return score > 0 and score not in POPULAR_UNKNOWN_PROVIDER_SCORES
+
+
+def _popular_signal_maps(db: Session, track_ids: list[int]) -> dict[int, dict[str, int]]:
+    if not track_ids:
+        return {}
+    result: dict[int, dict[str, int]] = {int(track_id): {} for track_id in track_ids}
+    repeat_cap = max(1, int(POPULAR_RANKING_CONFIG.repeat_cap_per_user))
+    cutoff = datetime.utcnow() - timedelta(days=14)
+    capped_play = case(
+        (ListeningHistory.play_count > repeat_cap, repeat_cap),
+        else_=ListeningHistory.play_count,
+    )
+    recent_play = case(
+        (ListeningHistory.played_at >= cutoff, capped_play),
+        else_=0,
+    )
+    legacy_rows = db.execute(
+        select(
+            ListeningHistory.track_id,
+            func.count(func.distinct(ListeningHistory.user_id)),
+            func.coalesce(func.sum(capped_play), 0),
+            func.coalesce(func.sum(recent_play), 0),
+        )
+        .where(
+            ListeningHistory.track_id.in_(track_ids),
+            ListeningHistory.event_id.is_(None),
+        )
+        .group_by(ListeningHistory.track_id)
+    ).all()
+    for track_id, unique_listeners, capped_plays, recent_plays in legacy_rows:
+        result[int(track_id)].update(
+            unique_listeners=int(unique_listeners or 0),
+            capped_plays=int(capped_plays or 0),
+            recent_plays=int(recent_plays or 0),
+        )
+
+    detailed_rows = db.execute(
+        select(
+            ListeningHistory.track_id,
+            func.count(ListeningHistory.id),
+            func.coalesce(
+                func.sum(case((ListeningHistory.completed == True, 1), else_=0)),
+                0,
+            ),
+            func.coalesce(
+                func.sum(case((ListeningHistory.skipped == True, 1), else_=0)),
+                0,
+            ),
+        )
+        .where(
+            ListeningHistory.track_id.in_(track_ids),
+            ListeningHistory.event_id.is_not(None),
+        )
+        .group_by(ListeningHistory.track_id)
+    ).all()
+    for track_id, detailed_plays, completed_plays, skipped_plays in detailed_rows:
+        result[int(track_id)].update(
+            detailed_plays=int(detailed_plays or 0),
+            completed_plays=int(completed_plays or 0),
+            skipped_plays=int(skipped_plays or 0),
+        )
+
+    favorite_rows = db.execute(
+        select(
+            UserFavorite.track_id,
+            func.count(func.distinct(UserFavorite.user_id)),
+        )
+        .where(UserFavorite.track_id.in_(track_ids))
+        .group_by(UserFavorite.track_id)
+    ).all()
+    for track_id, favorite_count in favorite_rows:
+        result[int(track_id)]["favorite_count"] = int(favorite_count or 0)
+
+    playlist_rows = db.execute(
+        select(
+            UserPlaylistTrack.track_id,
+            func.count(func.distinct(UserPlaylist.user_id)),
+        )
+        .join(UserPlaylist, UserPlaylist.id == UserPlaylistTrack.playlist_id)
+        .where(UserPlaylistTrack.track_id.in_(track_ids))
+        .group_by(UserPlaylistTrack.track_id)
+    ).all()
+    for track_id, playlist_add_count in playlist_rows:
+        result[int(track_id)]["playlist_add_count"] = int(playlist_add_count or 0)
+    return result
 
 
 def _primary_artist_name(track: Track) -> str:

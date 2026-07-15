@@ -1,3 +1,4 @@
+import json
 import os
 from collections import Counter
 from dataclasses import replace
@@ -19,7 +20,11 @@ from app.models.track import Track, TrackArtist
 from app.models.user import User
 from app.services import recommendation_service
 from app.services.normalization_service import normalize_artist_name, normalize_title
-from app.services.personalized_ranking_service import ScoredRecommendation, rerank_for_diversity
+from app.services.personalized_ranking_service import (
+    ScoredRecommendation,
+    choose_weighted_mix,
+    rerank_for_diversity,
+)
 from app.services.recommendation_service import (
     get_personalized_recommendations,
     invalidate_recommendations,
@@ -41,6 +46,7 @@ def _artist_track(
     needs_review: bool = False,
     popularity: float = 60.0,
     index: int = 1,
+    tags: tuple[str, ...] = (),
 ) -> tuple[Artist, Track]:
     artist = Artist(
         name=name,
@@ -61,6 +67,7 @@ def _artist_track(
         is_playable=playable,
         source_name="soundcloud",
         source_url=f"https://soundcloud.com/{slug}/song-{index}",
+        tags_json=json.dumps(tags),
         needs_review=needs_review,
     )
     db.add(track)
@@ -96,14 +103,26 @@ def test_cold_start_returns_only_available_catalog_tracks() -> None:
     invalidate_recommendations()
 
 
-def test_genre_overlap_produces_similar_artist_recommendation() -> None:
+def test_genre_and_tag_overlap_produce_similar_artist_recommendation() -> None:
     invalidate_recommendations()
     engine = _engine()
     with Session(engine) as db:
         user = User(login="similar-user", nickname="Listener", password_hash="hash")
         db.add(user)
-        preferred_artist, preferred_track = _artist_track(db, "Preferred Rock", "Rock", popularity=70)
-        similar_artist, similar_track = _artist_track(db, "Related Rock", "Rock", popularity=68)
+        preferred_artist, preferred_track = _artist_track(
+            db,
+            "Preferred Rock",
+            "Rock",
+            popularity=70,
+            tags=("shoegaze", "dream rock"),
+        )
+        similar_artist, similar_track = _artist_track(
+            db,
+            "Related Rock",
+            "Rock",
+            popularity=68,
+            tags=("shoegaze", "dream rock"),
+        )
         _, unrelated_track = _artist_track(db, "Unrelated Classical", "Classical", popularity=67)
         db.flush()
         db.add(
@@ -133,6 +152,107 @@ def test_genre_overlap_produces_similar_artist_recommendation() -> None:
         )
         assert unrelated_track.id in by_track
         assert similar_artist.id != preferred_artist.id
+
+    engine.dispose()
+    invalidate_recommendations()
+
+
+def test_broad_genre_or_provider_popularity_alone_does_not_claim_similarity() -> None:
+    invalidate_recommendations()
+    engine = _engine()
+    with Session(engine) as db:
+        user = User(login="strict-similarity", nickname="Listener", password_hash="hash")
+        db.add(user)
+        preferred_artist, _ = _artist_track(
+            db,
+            "Preferred Rap",
+            "Hip-Hop/Rap",
+            popularity=75,
+            tags=("provider", "soundcloud"),
+        )
+        _, same_broad_genre = _artist_track(
+            db,
+            "Generic Rap Upload",
+            "Hip-hop & Rap",
+            popularity=75,
+            tags=("provider", "soundcloud"),
+        )
+        _, popularity_only = _artist_track(
+            db,
+            "No Metadata Upload",
+            "soundcloud",
+            popularity=75,
+            tags=("provider", "soundcloud"),
+        )
+        db.flush()
+        db.add(
+            UserArtistPreference(
+                user_id=user.id,
+                artist_id=preferred_artist.id,
+                source="onboarding",
+                explicit_weight=5.0,
+                behavior_weight=0.0,
+                weight=5.0,
+                explicit_selected=True,
+            )
+        )
+        db.commit()
+
+        result = get_personalized_recommendations(db, user_id=user.id, limit=10)
+        by_track = {item.track.id: item for item in result.items}
+
+        assert by_track[same_broad_genre.id].recommendation_type == "genre"
+        assert by_track[popularity_only.id].recommendation_type != "similar"
+        assert all(
+            item.reason != "Похоже на Preferred Rap - по вашим предпочтениям"
+            for item in result.items
+        )
+
+    engine.dispose()
+    invalidate_recommendations()
+
+
+def test_provider_credit_to_selected_artist_is_not_labeled_similar_to_itself() -> None:
+    invalidate_recommendations()
+    engine = _engine()
+    with Session(engine) as db:
+        user = User(login="credit-user", nickname="Listener", password_hash="hash")
+        db.add(user)
+        preferred_artist, _ = _artist_track(
+            db,
+            "Preferred Artist",
+            "Hip-Hop/Rap",
+            popularity=60,
+        )
+        _, credited_track = _artist_track(
+            db,
+            "Upload Account",
+            "Hip-hop & Rap",
+            popularity=75,
+            tags=("Preferred Artist",),
+        )
+        credited_track.title = "Preferred Artist - New Track"
+        db.flush()
+        db.add(
+            UserArtistPreference(
+                user_id=user.id,
+                artist_id=preferred_artist.id,
+                source="onboarding",
+                explicit_weight=5.0,
+                behavior_weight=0.0,
+                weight=5.0,
+                explicit_selected=True,
+            )
+        )
+        db.commit()
+
+        result = get_personalized_recommendations(db, user_id=user.id, limit=10)
+        recommendation = next(item for item in result.items if item.track.id == credited_track.id)
+
+        assert recommendation.recommendation_type == "selected"
+        assert recommendation.reason == (
+            "От Preferred Artist - выбран вами при регистрации"
+        )
 
     engine.dispose()
     invalidate_recommendations()
@@ -202,6 +322,44 @@ def test_diversity_reranker_avoids_adjacent_artist_and_caps_two_in_ten() -> None
 
     assert all(left != right for left, right in zip(head_artists, head_artists[1:]))
     assert max(Counter(head_artists).values()) <= 2
+
+
+def test_weighted_bucket_selection_round_robins_artists_before_repeats() -> None:
+    candidates = [
+        ScoredRecommendation(
+            item=f"dominant-{index}",
+            stable_key=f"dominant-{index}",
+            artist_id=1,
+            genre_key="rock",
+            recommendation_type="selected",
+            reason="selected",
+            score=100 - index,
+        )
+        for index in range(8)
+    ]
+    candidates.extend(
+        ScoredRecommendation(
+            item=f"other-{artist_id}",
+            stable_key=f"other-{artist_id}",
+            artist_id=artist_id,
+            genre_key="rock",
+            recommendation_type="selected",
+            reason="selected",
+            score=50 - artist_id,
+        )
+        for artist_id in range(2, 6)
+    )
+
+    ranked = choose_weighted_mix(
+        candidates,
+        limit=6,
+        shares={"selected": 1.0},
+        rotation_key="round-robin",
+    )
+
+    counts = Counter(item.artist_id for item in ranked)
+    assert len(counts) == 5
+    assert counts[1] == 2
 
 
 def test_hidden_artist_is_excluded_from_recommendations() -> None:
@@ -297,6 +455,58 @@ def test_selected_artist_outside_global_candidate_limit_is_included(
         result = get_personalized_recommendations(db, user_id=user.id, limit=10)
 
         assert selected_track.id in {item.track.id for item in result.items}
+
+    engine.dispose()
+    invalidate_recommendations()
+
+
+def test_genre_alias_pool_discovers_relevant_artist_outside_global_top() -> None:
+    invalidate_recommendations()
+    engine = _engine()
+    with Session(engine) as db:
+        user = User(login="alias-pool-user", nickname="Listener", password_hash="hash")
+        db.add(user)
+        preferred_artist, _ = _artist_track(
+            db,
+            "Preferred Alias Artist",
+            "Hip-Hop/Rap",
+            popularity=1,
+            tags=("dark trap",),
+        )
+        _, related_track = _artist_track(
+            db,
+            "Related Alias Artist",
+            "Hip-hop & Rap",
+            popularity=1,
+            tags=("dark trap",),
+        )
+        for index in range(55):
+            _artist_track(
+                db,
+                f"Popular Unrelated {index}",
+                "Classical",
+                popularity=100,
+                index=index + 1,
+            )
+        db.flush()
+        db.add(
+            UserArtistPreference(
+                user_id=user.id,
+                artist_id=preferred_artist.id,
+                source="onboarding",
+                explicit_weight=5.0,
+                behavior_weight=0.0,
+                weight=5.0,
+                explicit_selected=True,
+            )
+        )
+        db.commit()
+
+        result = get_personalized_recommendations(db, user_id=user.id, limit=100)
+        by_track = {item.track.id: item for item in result.items}
+
+        assert related_track.id in by_track
+        assert by_track[related_track.id].recommendation_type == "similar"
 
     engine.dispose()
     invalidate_recommendations()

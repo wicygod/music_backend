@@ -18,6 +18,7 @@ from app.services.normalization_service import normalize_name
 POPULAR_DISPLAY_ARTISTS = {
     "lil peep": "Lil Peep",
     "9 mice": "9 mice",
+    "9mice": "9mice",
     "kai angel": "Kai Angel",
     "viperr": "Viperr",
     "pharaoh": "Pharaoh",

@@ -103,6 +103,29 @@ Invoke-RestMethod http://127.0.0.1:8000/api/import/seed-artists/summary
 Invoke-RestMethod "http://127.0.0.1:8000/api/artists?priority=high&limit=20"
 ```
 
+## Popular chart
+
+`GET /api/feed/home` exposes the public chart in `top` and keeps the legacy
+`trending` field for older clients. The `popular-v2` rank combines trusted
+provider counters, canonical artist reach, unique listeners, capped repeat
+plays, completion/skip signals, favorites, playlists, quality, and a diversity
+rerank. Repeat listening counts, but one account contributes at most the
+configured repeat cap for a track.
+
+New provider searches store real SoundCloud/YouTube popularity counters. To
+inspect a bounded legacy refresh without changing the catalog, run:
+
+```powershell
+python -m app.cli refresh-track-popularity --limit 20 --dry-run
+python -m app.cli refresh-track-popularity --limit 60 --chart-only --dry-run
+```
+
+After reviewing the dry run and obtaining production-data approval, omit
+`--dry-run` to persist that bounded batch. Use the returned `last_track_id` as
+`--after-id` for the next batch so temporarily unavailable provider rows cannot
+block progress. Chart thresholds and weights are listed in `.env.example`
+under `MUSIC_POPULAR_*`.
+
 ## Metadata Providers
 
 The first metadata provider uses the iTunes Search API. It is used only for

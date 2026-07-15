@@ -71,7 +71,7 @@ def choose_weighted_mix(
         if quota <= 0:
             continue
         bucket_items = [item for item in ordered if item.recommendation_type == bucket]
-        for item in bucket_items[:quota]:
+        for item in _take_diverse_bucket(bucket_items, quota=quota):
             selected.append(item)
             selected_keys.add(item.stable_key)
             remaining_slots -= 1
@@ -87,6 +87,38 @@ def choose_weighted_mix(
                 break
 
     return rerank_for_diversity(selected, rotation_key=rotation_key)
+
+
+def _take_diverse_bucket(
+    candidates: list[ScoredRecommendation[T]],
+    *,
+    quota: int,
+) -> list[ScoredRecommendation[T]]:
+    """Fill a bucket in artist rounds before taking another track per artist."""
+
+    requested = max(0, int(quota))
+    remaining = list(candidates)
+    selected: list[ScoredRecommendation[T]] = []
+    artist_counts: Counter[int] = Counter()
+    per_artist_cap = 1
+
+    while remaining and len(selected) < requested:
+        progressed = False
+        for item in list(remaining):
+            if item.artist_id is not None and artist_counts[item.artist_id] >= per_artist_cap:
+                continue
+            selected.append(item)
+            remaining.remove(item)
+            if item.artist_id is not None:
+                artist_counts[item.artist_id] += 1
+            progressed = True
+            if len(selected) >= requested:
+                break
+        if not progressed:
+            per_artist_cap += 1
+            continue
+        per_artist_cap += 1
+    return selected
 
 
 def rerank_for_diversity(
