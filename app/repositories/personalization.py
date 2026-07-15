@@ -474,6 +474,7 @@ def replace_explicit_preferences(
         )
         _decay_behavior_weight(preference, timestamp)
         preference.explicit_selected = True
+        preference.explicit_source = source
         preference.explicit_weight = _clamp(configured_weight)
         preference.weight = _combined_weight(preference)
         preference.is_hidden = False
@@ -485,6 +486,7 @@ def replace_explicit_preferences(
             continue
         _decay_behavior_weight(preference, timestamp)
         preference.explicit_selected = False
+        preference.explicit_source = None
         preference.explicit_weight = 0.0
         preference.weight = _combined_weight(preference)
         preference.source = source

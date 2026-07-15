@@ -44,6 +44,9 @@ def test_clean_database_upgrades_through_full_personalization_chain(tmp_path: Pa
         for item in inspector.get_foreign_keys("listening_history")
     }
     assert {("user_id",), ("artist_id",)} <= preference_foreign_keys
+    assert "explicit_source" in {
+        column["name"] for column in inspector.get_columns("user_artist_preferences")
+    }
     assert ("artist_id",) in history_foreign_keys
     history_indexes = {item["name"]: item for item in inspector.get_indexes("listening_history")}
     assert history_indexes["uq_listening_history_legacy_user_track"]["unique"] == 1
@@ -61,5 +64,5 @@ def test_clean_database_upgrades_through_full_personalization_chain(tmp_path: Pa
         "ix_artists_canonical_popularity",
     } <= artist_indexes
     with engine.connect() as connection:
-        assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0008_normalize_cyrillic_artist_keys"
+        assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0009_explicit_preference_source"
     engine.dispose()

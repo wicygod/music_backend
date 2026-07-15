@@ -151,6 +151,7 @@ def test_settings_removal_preserves_behavioral_interest() -> None:
 
         assert result.removed_artist_ids == [artists[0].id, artists[2].id]
         assert removed.explicit_selected is False
+        assert removed.explicit_source is None
         assert removed.explicit_weight == 0.0
         assert removed.behavior_weight == pytest.approx(4.0, abs=0.01)
         assert removed.weight == pytest.approx(4.0, abs=0.01)

@@ -80,6 +80,11 @@ def get_personalized_recommendations(
     explicit_artist_ids = {
         item.artist_id for item in visible_preferences if item.explicit_selected
     }
+    explicit_artist_sources = {
+        item.artist_id: (item.explicit_source or item.source or "explicit")
+        for item in visible_preferences
+        if item.explicit_selected
+    }
     preferred_artist_ids = explicit_artist_ids | {
         artist_id for artist_id, weight in effective_preferences.items() if weight > 0
     }
@@ -96,6 +101,7 @@ def get_personalized_recommendations(
         user_id=user_id,
         artist_preferences=effective_preferences,
         explicit_artist_ids=explicit_artist_ids,
+        explicit_artist_sources=explicit_artist_sources,
         hidden_artist_ids={item.artist_id for item in preferences if item.is_hidden},
         personalization_active=personalization_active,
     )
@@ -231,6 +237,7 @@ def _score_candidates(
     user_id: int,
     artist_preferences: dict[int, float],
     explicit_artist_ids: set[int],
+    explicit_artist_sources: dict[int, str] | None = None,
     hidden_artist_ids: set[int],
     personalization_active: bool,
 ) -> list[ScoredRecommendation[Track]]:
@@ -238,10 +245,15 @@ def _score_candidates(
     artist_popularity_values: dict[int, list[float]] = defaultdict(list)
     collaborations: dict[int, set[int]] = defaultdict(set)
     track_artist_ids: dict[int, list[int]] = {}
+    artist_names: dict[int, str] = {}
+    explicit_artist_sources = explicit_artist_sources or {}
 
     for track in candidates:
         artist_ids = _track_artist_ids(track)
         track_artist_ids[track.id] = artist_ids
+        for link in track.artist_links:
+            if link.artist_id and link.artist is not None:
+                artist_names[int(link.artist_id)] = str(link.artist.name or "").strip()
         genre = canonical_genre(track.genre)
         for artist_id in artist_ids:
             if genre:
@@ -324,6 +336,9 @@ def _score_candidates(
             personalization_active=personalization_active,
             artist_ids=artist_ids,
             explicit_artist_ids=explicit_artist_ids,
+            explicit_artist_sources=explicit_artist_sources,
+            artist_names=artist_names,
+            artist_preferences=normalized_preferences,
             artist_signal=artist_signal,
             similar_signal=similar_signal,
             genre_signal=genre_signal,
@@ -446,6 +461,9 @@ def _recommendation_label(
     personalization_active: bool,
     artist_ids: list[int],
     explicit_artist_ids: set[int],
+    explicit_artist_sources: dict[int, str],
+    artist_names: dict[int, str],
+    artist_preferences: dict[int, float],
     artist_signal: float,
     similar_signal: float,
     genre_signal: float,
@@ -455,9 +473,27 @@ def _recommendation_label(
         if popularity_signal >= 0.45:
             return "popular", "Популярно среди слушателей"
         return "exploration", "Откройте для себя что-то новое"
-    if any(artist_id in explicit_artist_ids for artist_id in artist_ids):
-        return "selected", "От выбранного вами артиста"
+    explicit_artist_id = next(
+        (artist_id for artist_id in artist_ids if artist_id in explicit_artist_ids),
+        None,
+    )
+    if explicit_artist_id is not None:
+        artist_name = artist_names.get(explicit_artist_id) or "выбранного артиста"
+        explicit_source = explicit_artist_sources.get(explicit_artist_id, "explicit")
+        if explicit_source == "onboarding":
+            return "selected", f"От {artist_name} — выбран вами при регистрации"
+        if explicit_source == "settings":
+            return "selected", f"От {artist_name} — выбран вами в настройках"
+        return "selected", f"От {artist_name} — выбран вами в музыкальном вкусе"
     if artist_signal > 0:
+        preferred_artist_id = max(
+            artist_ids,
+            key=lambda artist_id: artist_preferences.get(artist_id, 0.0),
+            default=None,
+        )
+        artist_name = artist_names.get(preferred_artist_id or 0)
+        if artist_name:
+            return "selected", f"От {artist_name} — на основе ваших предпочтений"
         return "selected", "На основе вашей истории прослушиваний"
     if similar_signal > 0:
         return "similar", "Похоже на любимых артистов"

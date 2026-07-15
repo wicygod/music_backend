@@ -36,6 +36,7 @@ class UserArtistPreference(Base):
         nullable=False,
     )
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="onboarding")
+    explicit_source: Mapped[str | None] = mapped_column(String(32), nullable=True)
     explicit_weight: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     behavior_weight: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     weight: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
