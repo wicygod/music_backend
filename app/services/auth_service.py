@@ -121,6 +121,7 @@ def user_to_read(user: User) -> UserRead:
         nickname=user.nickname,
         avatar_url=user.avatar_url,
         subscription_status=user.subscription_status,
+        music_preferences_completed_at=user.music_preferences_completed_at,
         created_at=user.created_at,
         is_banned=bool(user.block),
     )

@@ -3,6 +3,7 @@ import random
 import re
 import time
 import threading
+from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urlparse
@@ -16,6 +17,7 @@ from app.repositories.artists import find_or_create_artist
 from app.repositories.tracks import search_tracks
 from app.repositories.tracks import (
     create_track_with_artist,
+    ensure_track_artist_link,
     find_duplicate_track_for_artist,
     find_track_by_provider_external_id,
 )
@@ -31,6 +33,7 @@ from app.services.artist_cleanup_service import (
 from app.services.cover_service import extract_cover_url, fetch_soundcloud_oembed_cover
 from app.services.normalization_service import clean_display_artist_name, detect_artist_region, normalize_name, normalize_title
 from app.services.serialization_service import track_to_read
+from app.services.soundcloud_profile_service import fetch_soundcloud_profile
 from app.services.proxy_rotator import proxy_rotator
 from app.services.track_filter_service import dedupe_tracks, is_music_track
 
@@ -612,10 +615,39 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
     if not title or not artist_name or not source_url or not _is_allowed_provider_entry(provider_name, result):
         return False
 
+    uploader_profile = None
+    profile_artist = None
+    if provider_name == "soundcloud":
+        uploader_profile = fetch_soundcloud_profile(_entry_artist_url(result) or "", timeout=5.0)
+        if uploader_profile is not None:
+            profile_artist, _profile_created = find_or_create_artist(
+                db,
+                name=uploader_profile.username,
+                region=detect_artist_region(uploader_profile.username),
+                avatar_url=uploader_profile.avatar_url,
+                genres=[],
+                source_name="soundcloud",
+                source_external_id=uploader_profile.external_id,
+                source_url=uploader_profile.permalink_url,
+                source_followers_count=uploader_profile.followers_count,
+                source_verified=uploader_profile.verified,
+                is_canonical=True,
+                profile_resolved_at=datetime.utcnow(),
+                import_status="imported",
+            )
+
     external_id = str(result.get("id") or source_url)
     existing = find_track_by_provider_external_id(db, provider=provider_name, external_id=external_id)
     if existing:
         changed = _canonicalize_catalog_track_source(existing)
+        if profile_artist is not None:
+            ensure_track_artist_link(
+                db,
+                track_id=existing.id,
+                artist_id=profile_artist.id,
+                role="uploader",
+            )
+            changed = True
         parsed_artist = artist_from_title(raw_title)
         current_artists = {
             normalize_name(link.artist.name)
@@ -623,15 +655,23 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
             if getattr(link, "artist", None) and link.artist.name
         }
         if parsed_artist and normalize_name(parsed_artist) not in current_artists:
+            parsed_matches_profile = bool(
+                uploader_profile
+                and normalize_name(uploader_profile.username) == normalize_name(parsed_artist)
+            )
             repaired_artist, _created = find_or_create_artist(
                 db,
                 name=parsed_artist,
                 region=detect_artist_region(parsed_artist),
-                avatar_url=_entry_artist_url(result),
+                avatar_url=uploader_profile.avatar_url if parsed_matches_profile else None,
                 genres=[],
-                source_name=provider_name,
-                source_external_id=str(result.get("uploader_id") or result.get("channel_id") or parsed_artist),
-                source_url=_entry_artist_url(result),
+                source_name=provider_name if parsed_matches_profile else None,
+                source_external_id=uploader_profile.external_id if parsed_matches_profile else None,
+                source_url=uploader_profile.permalink_url if parsed_matches_profile else None,
+                source_followers_count=uploader_profile.followers_count if parsed_matches_profile else None,
+                source_verified=uploader_profile.verified if parsed_matches_profile else None,
+                is_canonical=True if parsed_matches_profile else None,
+                profile_resolved_at=datetime.utcnow() if parsed_matches_profile else None,
                 import_status="imported",
             )
             existing.artist_links.clear()
@@ -680,18 +720,33 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
             if changed:
                 db.add(duplicate)
                 db.commit()
+        if profile_artist is not None:
+            ensure_track_artist_link(
+                db,
+                track_id=duplicate.id,
+                artist_id=profile_artist.id,
+                role="uploader",
+            )
+            db.commit()
         return True
 
-    artist_url = _entry_artist_url(result)
+    profile_matches_artist = bool(
+        uploader_profile
+        and normalize_name(uploader_profile.username) == normalize_name(artist_name)
+    )
     artist, _created = find_or_create_artist(
         db,
         name=artist_name,
         region=detect_artist_region(artist_name),
-        avatar_url=artist_url,
+        avatar_url=uploader_profile.avatar_url if profile_matches_artist else None,
         genres=[],
-        source_name=provider_name,
-        source_external_id=str(result.get("uploader_id") or result.get("channel_id") or artist_name),
-        source_url=artist_url,
+        source_name=provider_name if profile_matches_artist else None,
+        source_external_id=uploader_profile.external_id if profile_matches_artist else None,
+        source_url=uploader_profile.permalink_url if profile_matches_artist else None,
+        source_followers_count=uploader_profile.followers_count if profile_matches_artist else None,
+        source_verified=uploader_profile.verified if profile_matches_artist else None,
+        is_canonical=True if profile_matches_artist else None,
+        profile_resolved_at=datetime.utcnow() if profile_matches_artist else None,
         import_status="imported",
     )
     payload = TrackSeedCreate(
@@ -711,7 +766,14 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
         source_url=str(source_url),
         needs_review=False,
     )
-    create_track_with_artist(db, payload, artist)
+    track = create_track_with_artist(db, payload, artist)
+    if profile_artist is not None and profile_artist.id != artist.id:
+        ensure_track_artist_link(
+            db,
+            track_id=track.id,
+            artist_id=profile_artist.id,
+            role="uploader",
+        )
     db.commit()
     return True
 

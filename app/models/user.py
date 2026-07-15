@@ -16,9 +16,20 @@ class User(Base):
     avatar_url: Mapped[str | None] = mapped_column(Text, nullable=True)
     subscription_status: Mapped[str] = mapped_column(String(32), nullable=False, default="inactive")
     total_listening_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    music_preferences_completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
     block = relationship("BlockedUser", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    artist_preferences = relationship(
+        "UserArtistPreference",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
+    recommendation_events = relationship(
+        "RecommendationEvent",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 
 class BlockedUser(Base):

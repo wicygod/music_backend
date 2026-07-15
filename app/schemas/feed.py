@@ -3,6 +3,13 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.schemas.track import TrackRead
 
 
+class RecommendationTrack(BaseModel):
+    track: TrackRead
+    recommendation_type: str
+    reason: str
+    algorithm_version: str
+
+
 class HomeFeed(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -11,3 +18,6 @@ class HomeFeed(BaseModel):
     trending: list[TrackRead]
     ru: list[TrackRead]
     global_: list[TrackRead] = Field(serialization_alias="global")
+    personalized: list[RecommendationTrack] = Field(default_factory=list)
+    personalization_active: bool = False
+    algorithm_version: str | None = None

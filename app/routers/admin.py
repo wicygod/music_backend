@@ -15,6 +15,7 @@ from app.database import get_db
 from app.models.artist import Artist
 from app.models.history import ListeningHistory
 from app.models.playlist import UserFavorite, UserPlaylist, UserPlaylistTrack
+from app.models.personalization import RecommendationEvent, UserArtistPreference
 from app.models.track import Track, TrackArtist
 from app.models.user import BlockedUser, User
 from app.schemas.auth import BanRequest
@@ -52,6 +53,7 @@ def _top_tracks(db: Session, limit: int = 10) -> list[dict]:
     stmt = (
         select(Track, func.sum(ListeningHistory.play_count).label("play_count"))
         .join(ListeningHistory, ListeningHistory.track_id == Track.id)
+        .where(ListeningHistory.event_id.is_(None))
         .options(selectinload(Track.artist_links).selectinload(TrackArtist.artist))
         .group_by(Track.id)
         .order_by(desc("play_count"), Track.title.asc())
@@ -88,7 +90,12 @@ def _user_metrics(db: Session, user_id: int) -> dict:
         )
     return {
         "history_count": int(
-            db.execute(select(func.sum(ListeningHistory.play_count)).where(ListeningHistory.user_id == scope)).scalar() or 0
+            db.execute(
+                select(func.sum(ListeningHistory.play_count)).where(
+                    ListeningHistory.user_id == scope,
+                    ListeningHistory.event_id.is_(None),
+                )
+            ).scalar() or 0
         ),
         "favorites_count": int(
             db.execute(select(func.count(UserFavorite.track_id)).where(UserFavorite.user_id == scope)).scalar() or 0
@@ -241,7 +248,11 @@ def admin_stats(db: Session = Depends(get_db)) -> dict:
     stats = system_stats()
     stats["top_tracks"] = _top_tracks(db, limit=10)
     stats["total_users"] = int(db.execute(select(func.count(User.id))).scalar() or 0)
-    stats["total_plays"] = int(db.execute(select(func.sum(ListeningHistory.play_count))).scalar() or 0)
+    stats["total_plays"] = int(
+        db.execute(
+            select(func.sum(ListeningHistory.play_count)).where(ListeningHistory.event_id.is_(None))
+        ).scalar() or 0
+    )
     stats["banned_users"] = int(db.execute(select(func.count(BlockedUser.id))).scalar() or 0)
     return stats
 
@@ -305,7 +316,10 @@ def admin_user_detail(user_id: int, db: Session = Depends(get_db)) -> dict:
     history_stmt = (
         select(Track, ListeningHistory.played_at)
         .join(ListeningHistory, ListeningHistory.track_id == Track.id)
-        .where(ListeningHistory.user_id == _user_scope(user_id))
+        .where(
+            ListeningHistory.user_id == _user_scope(user_id),
+            ListeningHistory.event_id.is_(None),
+        )
         .options(selectinload(Track.artist_links).selectinload(TrackArtist.artist))
         .order_by(ListeningHistory.played_at.desc())
         .limit(20)
@@ -387,6 +401,12 @@ def clear_user_data(user_id: int, db: Session = Depends(get_db)) -> dict:
     db.query(UserPlaylist).filter(UserPlaylist.user_id == scope).delete(synchronize_session=False)
     db.query(UserFavorite).filter(UserFavorite.user_id == scope).delete(synchronize_session=False)
     db.query(ListeningHistory).filter(ListeningHistory.user_id == scope).delete(synchronize_session=False)
+    db.query(RecommendationEvent).filter(RecommendationEvent.user_id == user_id).delete(synchronize_session=False)
+    db.query(UserArtistPreference).filter(UserArtistPreference.user_id == user_id).delete(synchronize_session=False)
+    user.music_preferences_completed_at = None
     db.commit()
+    from app.services.recommendation_service import invalidate_recommendations
+
+    invalidate_recommendations(user_id)
     record_event("admin", f"Admin cleared data for @{user.login}", path=f"/api/admin/users/{user_id}/clear-data")
     return {"ok": True, "user": _user_payload(db, user)}

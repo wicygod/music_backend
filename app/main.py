@@ -6,7 +6,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.database import init_db
 from app.middleware.performance import PerformanceMetricsMiddleware
 from app.middleware.security import LightweightSecurityMiddleware
-from app.routers import admin, artists, auth, bugreport, feed, history, images, import_jobs, playlists, search, stream, tracks
+from app.routers import (
+    admin,
+    artists,
+    auth,
+    bugreport,
+    feed,
+    history,
+    images,
+    import_jobs,
+    personalization,
+    playlists,
+    search,
+    stream,
+    tracks,
+)
 
 
 @asynccontextmanager
@@ -42,6 +56,7 @@ app.include_router(search.router)
 app.include_router(stream.router)
 app.include_router(tracks.router)
 app.include_router(artists.router)
+app.include_router(personalization.router)
 app.include_router(playlists.router)
 app.include_router(import_jobs.router)
 

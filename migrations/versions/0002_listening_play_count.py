@@ -16,10 +16,14 @@ depends_on = None
 
 
 def upgrade() -> None:
-    with op.batch_alter_table("listening_history") as batch_op:
-        batch_op.add_column(sa.Column("play_count", sa.Integer(), nullable=False, server_default="1"))
+    columns = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("listening_history")}
+    if "play_count" not in columns:
+        with op.batch_alter_table("listening_history") as batch_op:
+            batch_op.add_column(sa.Column("play_count", sa.Integer(), nullable=False, server_default="1"))
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("listening_history") as batch_op:
-        batch_op.drop_column("play_count")
+    columns = {column["name"] for column in sa.inspect(op.get_bind()).get_columns("listening_history")}
+    if "play_count" in columns:
+        with op.batch_alter_table("listening_history") as batch_op:
+            batch_op.drop_column("play_count")

@@ -15,6 +15,9 @@ from app.services.auth_service import decode_access_token, decode_stream_ticket,
 
 
 RATE_LIMIT_PATH_RE = re.compile(r"^/api/(?:search|stream|auth/(?:register|login))(?:/|$)")
+EVENT_WRITE_PATH_RE = re.compile(
+    r"^/api/(?:history/events|feed/events|user/music-signals)(?:/|$)"
+)
 AUTH_EXEMPT_PATHS = {"/api/health", "/api/auth/register", "/api/auth/login", "/api/images/proxy"}
 STREAM_TRACK_PATH_RE = re.compile(r"^/api/stream/track/(\d+)$")
 
@@ -45,7 +48,11 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
             if auth_response:
                 return auth_response
 
-        if RATE_LIMIT_PATH_RE.match(request.url.path):
+        rate_limited = bool(RATE_LIMIT_PATH_RE.match(request.url.path)) or (
+            request.method in {"POST", "PUT", "PATCH"}
+            and bool(EVENT_WRITE_PATH_RE.match(request.url.path))
+        )
+        if rate_limited:
             if not ticket_auth:
                 limited_response = self._rate_limit_response(client_ip, request.url.path)
                 if limited_response:
@@ -112,6 +119,10 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
 
     @staticmethod
     def _rate_limit_policy(path: str) -> tuple[str, float, int, float]:
+        if EVENT_WRITE_PATH_RE.match(path):
+            # Playback can legitimately emit several analytics events per
+            # minute, but a bounded bucket prevents unbounded database growth.
+            return "events", 60.0, 180, 60.0
         if path.startswith("/api/auth/"):
             return "auth", 60.0, 10, 120.0
         if path.endswith("/prepare"):

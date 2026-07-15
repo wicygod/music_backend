@@ -1,0 +1,65 @@
+import os
+from pathlib import Path
+
+os.environ.setdefault("MUSIC_APP_AUTH_TOKEN", "test-app-token")
+os.environ.setdefault("MUSIC_ADMIN_API_KEY", "test-admin-key")
+os.environ.setdefault("MUSIC_JWT_SECRET", "test-jwt-secret")
+
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, inspect, text
+
+
+def test_clean_database_upgrades_through_full_personalization_chain(tmp_path: Path, monkeypatch) -> None:
+    database_path = tmp_path / "personalization-chain.db"
+    database_url = f"sqlite:///{database_path.as_posix()}"
+    monkeypatch.delenv("MUSIC_DATABASE_URL", raising=False)
+
+    config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.upgrade(config, "head")
+
+    engine = create_engine(database_url, future=True)
+    inspector = inspect(engine)
+    assert {"user_artist_preferences", "recommendation_events"} <= set(inspector.get_table_names())
+    assert {
+        "event_id",
+        "artist_id",
+        "listened_duration_seconds",
+        "track_duration_seconds",
+        "completion_ratio",
+        "completed",
+        "skipped",
+        "context",
+    } <= {column["name"] for column in inspector.get_columns("listening_history")}
+    assert "music_preferences_completed_at" in {
+        column["name"] for column in inspector.get_columns("users")
+    }
+    preference_foreign_keys = {
+        tuple(item["constrained_columns"])
+        for item in inspector.get_foreign_keys("user_artist_preferences")
+    }
+    history_foreign_keys = {
+        tuple(item["constrained_columns"])
+        for item in inspector.get_foreign_keys("listening_history")
+    }
+    assert {("user_id",), ("artist_id",)} <= preference_foreign_keys
+    assert ("artist_id",) in history_foreign_keys
+    history_indexes = {item["name"]: item for item in inspector.get_indexes("listening_history")}
+    assert history_indexes["uq_listening_history_legacy_user_track"]["unique"] == 1
+    artist_columns = {column["name"] for column in inspector.get_columns("artists")}
+    assert {
+        "is_canonical",
+        "source_followers_count",
+        "source_verified",
+        "profile_resolved_at",
+    } <= artist_columns
+    artist_indexes = {item["name"] for item in inspector.get_indexes("artists")}
+    assert {
+        "ix_artists_is_canonical",
+        "ix_artists_source_followers_count",
+        "ix_artists_canonical_popularity",
+    } <= artist_indexes
+    with engine.connect() as connection:
+        assert connection.execute(text("select version_num from alembic_version")).scalar_one() == "0008_normalize_cyrillic_artist_keys"
+    engine.dispose()

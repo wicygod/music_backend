@@ -6,6 +6,7 @@ Revises: 0002_listening_play_count
 from __future__ import annotations
 
 from alembic import op
+import sqlalchemy as sa
 
 
 revision = "0003_artist_import_indexes"
@@ -15,12 +16,22 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_index("ix_artists_import_status", "artists", ["import_status"], unique=False)
-    op.create_index("ix_artists_priority", "artists", ["priority"], unique=False)
-    op.create_index("ix_artists_seed_source", "artists", ["seed_source"], unique=False)
+    existing = {index["name"] for index in sa.inspect(op.get_bind()).get_indexes("artists")}
+    for name, columns in (
+        ("ix_artists_import_status", ["import_status"]),
+        ("ix_artists_priority", ["priority"]),
+        ("ix_artists_seed_source", ["seed_source"]),
+    ):
+        if name not in existing:
+            op.create_index(name, "artists", columns, unique=False)
 
 
 def downgrade() -> None:
-    op.drop_index("ix_artists_seed_source", table_name="artists")
-    op.drop_index("ix_artists_priority", table_name="artists")
-    op.drop_index("ix_artists_import_status", table_name="artists")
+    existing = {index["name"] for index in sa.inspect(op.get_bind()).get_indexes("artists")}
+    for name in (
+        "ix_artists_seed_source",
+        "ix_artists_priority",
+        "ix_artists_import_status",
+    ):
+        if name in existing:
+            op.drop_index(name, table_name="artists")
