@@ -2,6 +2,7 @@ import secrets
 import shutil
 import string
 import time
+from typing import Literal
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -33,7 +34,7 @@ _chart_cache: dict[str, object] = {"expires_at": 0.0, "items": []}
 class AdminUserUpdate(BaseModel):
     nickname: str | None = Field(default=None, min_length=2, max_length=96)
     avatar_url: str | None = Field(default=None, max_length=2_000_000)
-    subscription_status: str | None = Field(default=None, max_length=32)
+    subscription_status: Literal["inactive", "premium", "trial", "support"] | None = None
 
 
 class PasswordResetResponse(BaseModel):

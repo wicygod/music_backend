@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 from app.config import JWT_EXPIRES_SECONDS, JWT_SECRET
 from app.models.user import BlockedUser, User
 from app.schemas.auth import UserRead
+from app.services.subscription_service import has_premium_entitlement
 
 
 LOGIN_RE = re.compile(r"^[a-zA-Z0-9_.-]{3,64}$")
@@ -121,6 +122,7 @@ def user_to_read(user: User) -> UserRead:
         nickname=user.nickname,
         avatar_url=user.avatar_url,
         subscription_status=user.subscription_status,
+        is_premium=has_premium_entitlement(user),
         music_preferences_completed_at=user.music_preferences_completed_at,
         created_at=user.created_at,
         is_banned=bool(user.block),

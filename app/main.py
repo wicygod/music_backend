@@ -19,6 +19,7 @@ from app.routers import (
     playlists,
     search,
     stream,
+    subscriptions,
     tracks,
 )
 
@@ -54,6 +55,7 @@ app.include_router(history.router)
 app.include_router(images.router)
 app.include_router(search.router)
 app.include_router(stream.router)
+app.include_router(subscriptions.router)
 app.include_router(tracks.router)
 app.include_router(artists.router)
 app.include_router(personalization.router)

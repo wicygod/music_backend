@@ -14,7 +14,9 @@ from app.services.admin_monitor import record_event, record_session
 from app.services.auth_service import decode_access_token, decode_stream_ticket, is_user_banned
 
 
-RATE_LIMIT_PATH_RE = re.compile(r"^/api/(?:search|stream|auth/(?:register|login))(?:/|$)")
+RATE_LIMIT_PATH_RE = re.compile(
+    r"^/api/(?:search|stream|auth/(?:register|login)|subscriptions/checkout-preview)(?:/|$)"
+)
 EVENT_WRITE_PATH_RE = re.compile(
     r"^/api/(?:history/events|feed/events|user/music-signals)(?:/|$)"
 )
@@ -125,6 +127,8 @@ class LightweightSecurityMiddleware(BaseHTTPMiddleware):
             return "events", 60.0, 180, 60.0
         if path.startswith("/api/auth/"):
             return "auth", 60.0, 10, 120.0
+        if path.startswith("/api/subscriptions/checkout-preview"):
+            return "checkout-preview", 60.0, 15, 60.0
         if path.endswith("/prepare"):
             return "prepare", 60.0, 6, 30.0
         if path.endswith("/ticket"):

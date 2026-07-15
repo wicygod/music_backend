@@ -9,6 +9,7 @@ class UserRead(BaseModel):
     nickname: str
     avatar_url: str | None = None
     subscription_status: str = "inactive"
+    is_premium: bool = False
     music_preferences_completed_at: datetime | None = None
     created_at: datetime
     is_banned: bool = False
