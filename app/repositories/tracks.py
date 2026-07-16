@@ -176,37 +176,53 @@ def search_tracks(db: Session, query: str, limit: int = 50) -> list[Track]:
     normalized_query = normalize_name(query)
     if not normalized_query:
         return []
-    pattern = f"%{normalized_query}%"
-    title_pattern = f"%{normalize_title(query)}%"
+
+    def escape_like(value: str) -> str:
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    normalized_title_query = normalize_title(query)
+    pattern = f"%{escape_like(normalized_query)}%"
+    title_pattern = f"%{escape_like(normalized_title_query)}%"
     normalized_track_title = func.replace(Track.normalized_title, "ё", "е")
     normalized_artist_name = func.replace(Artist.normalized_name, "ё", "е")
     normalized_genre = func.replace(Track.genre, "ё", "е")
     normalized_tags = func.replace(Track.tags_json, "ё", "е")
     token_filters = [
         or_(
-            normalized_track_title.like(f"%{token}%"),
-            normalized_artist_name.like(f"%{token}%"),
-            normalized_genre.like(f"%{token}%"),
-            normalized_tags.like(f"%{token}%"),
+            normalized_track_title.like(f"%{escape_like(token)}%", escape="\\"),
+            normalized_artist_name.like(f"%{escape_like(token)}%", escape="\\"),
+            normalized_genre.like(f"%{escape_like(token)}%", escape="\\"),
+            normalized_tags.like(f"%{escape_like(token)}%", escape="\\"),
         )
         for token in normalized_query.split()
         if len(token) > 1
     ]
     token_match = and_(*token_filters) if token_filters else False
+    exact_title_rank = case((normalized_track_title == normalized_title_query, 0), else_=1)
+    exact_artist_rank = case((normalized_artist_name == normalized_query, 0), else_=1)
+    title_contains_rank = case((normalized_track_title.like(title_pattern, escape="\\"), 0), else_=1)
+    artist_contains_rank = case((normalized_artist_name.like(pattern, escape="\\"), 0), else_=1)
     stmt = (
         with_artists(select(Track))
         .join(TrackArtist)
         .join(Artist)
         .where(
             or_(
-                normalized_track_title.like(title_pattern),
-                normalized_artist_name.like(pattern),
-                normalized_genre.like(pattern),
-                normalized_tags.like(pattern),
+                normalized_track_title.like(title_pattern, escape="\\"),
+                normalized_artist_name.like(pattern, escape="\\"),
+                normalized_genre.like(pattern, escape="\\"),
+                normalized_tags.like(pattern, escape="\\"),
                 token_match,
             )
         )
-        .order_by(Track.popularity_score.desc(), Track.created_at.desc())
+        .order_by(
+            exact_title_rank,
+            exact_artist_rank,
+            title_contains_rank,
+            artist_contains_rank,
+            Track.popularity_score.desc(),
+            Track.created_at.desc(),
+        )
         .limit(limit)
     )
     return list(db.execute(stmt).scalars().unique().all())

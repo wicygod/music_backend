@@ -435,35 +435,87 @@ def _title_matches_query(title: str | None, query: str) -> bool:
     return _all_tokens_match(tokens, haystack)
 
 
+def _item_artist_text(item) -> str:
+    """Extract artist name from a Track object or a provider dict."""
+    if isinstance(item, dict):
+        return _entry_artist_name(item, "")
+    direct = getattr(item, "artist", None)
+    if isinstance(direct, str):
+        return direct
+    return " ".join(
+        link.artist.name
+        for link in getattr(item, "artist_links", []) or []
+        if getattr(link, "artist", None) and link.artist.name
+    )
+
+
+def _item_title_text(item) -> str:
+    """Extract raw title from a Track object or a provider dict."""
+    return _title_from_item(item)
+
+
+def _relevance_score(query: str, title_raw: str, artist_raw: str) -> int:
+    """Return a relevance tier for *query* against a title/artist pair.
+
+    Lower values mean higher relevance (used as a sort key).
+
+    Tiers
+    -----
+    0 – exact match of normalised title to query
+    1 – exact match after stripping "Artist - " prefix from the raw title
+    2 – exact match of normalised artist to query
+    3 – all query tokens found inside the title
+    4 – all query tokens found inside the artist
+    5 – all query tokens found across artist + title combined
+    6 – no match
+    """
+    norm_query = normalize_name(query)
+    tokens = _query_tokens(query)
+    norm_title = normalize_name(title_raw)
+    norm_artist = normalize_name(artist_raw)
+
+    # Tier 0: exact title match
+    if norm_title == norm_query:
+        return 0
+
+    # Tier 1: exact title match after stripping "Artist - " prefix
+    stripped = normalize_name(title_without_artist_prefix(title_raw))
+    if stripped != norm_title and stripped == norm_query:
+        return 1
+
+    # Tier 2: exact artist match
+    if norm_artist == norm_query:
+        return 2
+
+    # Tier 3: all tokens match inside title
+    if _all_tokens_match(tokens, norm_title):
+        return 3
+
+    # Tier 4: all tokens match inside artist
+    if _all_tokens_match(tokens, norm_artist):
+        return 4
+
+    # Tier 5: all tokens match across artist + title
+    if _all_tokens_match(tokens, f"{norm_artist} {norm_title}"):
+        return 5
+
+    return 6
+
+
 def _prefer_title_matches(items: list, query: str) -> list:
     if not items:
         return items
-    tokens = _query_tokens(query)
 
-    def artist_text(item) -> str:
-        if isinstance(item, dict):
-            return _entry_artist_name(item, "")
-        direct = getattr(item, "artist", None)
-        if isinstance(direct, str):
-            return direct
-        return " ".join(
-            link.artist.name
-            for link in getattr(item, "artist_links", []) or []
-            if getattr(link, "artist", None) and link.artist.name
+    return [
+        item
+        for _index, item in sorted(
+            enumerate(items),
+            key=lambda pair: (
+                _relevance_score(query, _item_title_text(pair[1]), _item_artist_text(pair[1])),
+                pair[0],
+            ),
         )
-
-    def rank(item) -> int:
-        artist = normalize_name(artist_text(item))
-        title = normalize_name(_title_from_item(item))
-        if _all_tokens_match(tokens, artist):
-            return 0
-        if _all_tokens_match(tokens, title):
-            return 1
-        if _all_tokens_match(tokens, f"{artist} {title}"):
-            return 2
-        return 3
-
-    return [item for _index, item in sorted(enumerate(items), key=lambda pair: (rank(pair[1]), pair[0]))]
+    ]
 
 
 def _canonicalize_catalog_track_source(track) -> bool:
@@ -505,14 +557,13 @@ def _provider_query_relevance(query: str, entry: dict) -> int:
     tokens = _query_tokens(query)
     if not tokens:
         return 0
-    title = normalize_name(str(entry.get("title") or ""))
-    artist = normalize_name(_entry_artist_name(entry, ""))
-    if _all_tokens_match(tokens, artist):
-        return 4 if artist == normalize_name(query) else 3
-    if _all_tokens_match(tokens, title):
-        return 2
-    combined = f"{artist} {title}"
-    return 1 if _all_tokens_match(tokens, combined) else 0
+    title_raw = str(entry.get("title") or "")
+    artist_raw = _entry_artist_name(entry, "")
+    tier = _relevance_score(query, title_raw, artist_raw)
+    if tier < 6:
+        # Invert so that callers (who sort descending) rank tier-0 highest.
+        return 7 - tier
+    return 0
 
 
 def _search_provider(query: str, provider: dict, limit: int) -> list[dict]:

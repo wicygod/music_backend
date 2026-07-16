@@ -12,7 +12,7 @@ router = APIRouter(prefix="/api", tags=["search"])
 @router.get("/search", response_model=list[TrackRead])
 def search(
     background_tasks: BackgroundTasks,
-    q: str = Query(..., min_length=1),
+    q: str = Query(..., min_length=1, max_length=128),
     limit: int = Query(150, ge=1, le=150),
     db: Session = Depends(get_db),
 ) -> list[TrackRead]:
