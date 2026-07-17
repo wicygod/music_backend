@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
+from app.models.album import AlbumTrack
 from app.models.artist import Artist
 from app.models.history import ListeningHistory
 from app.models.playlist import UserFavorite, UserPlaylist, UserPlaylistTrack
@@ -16,7 +17,15 @@ from app.services.artist_cleanup_service import (
     popular_track_key,
     primary_artist_segment,
 )
-from app.services.normalization_service import normalize_name, normalize_title, normalize_track_title_for_dedupe
+from app.services.normalization_service import (
+    compact_search_text,
+    normalize_name,
+    normalize_search_text,
+    normalize_title,
+    normalize_track_title_for_dedupe,
+    search_candidate_fragments,
+    search_tokens,
+)
 from app.services.popular_ranking_service import (
     POPULAR_RANKING_CONFIG,
     PROVIDER_POPULARITY_TAG,
@@ -71,7 +80,10 @@ POPULAR_BLOCKED_PHRASES = (
 
 
 def with_artists(stmt):
-    return stmt.options(selectinload(Track.artist_links).selectinload(TrackArtist.artist))
+    return stmt.options(
+        selectinload(Track.artist_links).selectinload(TrackArtist.artist),
+        selectinload(Track.album_links).selectinload(AlbumTrack.album),
+    )
 
 
 def get_track(db: Session, track_id: int) -> Track | None:
@@ -106,7 +118,10 @@ def find_duplicate_track_for_artist(
         with_artists(select(Track))
         .join(TrackArtist)
         .join(Artist)
-        .where(Artist.normalized_name == normalized_artist)
+        .where(
+            Artist.normalized_name == normalized_artist,
+            TrackArtist.role == "main",
+        )
     )
     candidates = db.execute(stmt).scalars().unique().all()
     for track in candidates:
@@ -172,36 +187,98 @@ def create_track_with_artist(db: Session, payload: TrackSeedCreate, artist: Arti
     return get_track(db, track.id) or track
 
 
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _compact_sql_text(expression):
+    compact = func.replace(expression, " ", "")
+    for character in (".", "/", "&", "-", "'", "#"):
+        compact = func.replace(compact, character, "")
+    return compact
+
+
+def _unique_tracks(rows: list[Track], limit: int) -> list[Track]:
+    result: list[Track] = []
+    seen_ids: set[int] = set()
+    for track in rows:
+        if track.id in seen_ids:
+            continue
+        seen_ids.add(track.id)
+        result.append(track)
+        if len(result) >= limit:
+            break
+    return result
+
+
 def search_tracks(db: Session, query: str, limit: int = 50) -> list[Track]:
     normalized_query = normalize_name(query)
-    if not normalized_query:
+    normalized_title_query = normalize_search_text(query)
+    if not normalized_title_query:
         return []
 
-    def escape_like(value: str) -> str:
-        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-
-    normalized_title_query = normalize_title(query)
-    pattern = f"%{escape_like(normalized_query)}%"
-    title_pattern = f"%{escape_like(normalized_title_query)}%"
+    safe_limit = max(1, min(int(limit), 500))
+    pattern = f"%{_escape_like(normalized_query)}%"
+    title_pattern = f"%{_escape_like(normalized_title_query)}%"
     normalized_track_title = func.replace(Track.normalized_title, "ё", "е")
     normalized_artist_name = func.replace(Artist.normalized_name, "ё", "е")
     normalized_genre = func.replace(Track.genre, "ё", "е")
-    normalized_tags = func.replace(Track.tags_json, "ё", "е")
+    compact_query = compact_search_text(query)
+    compact_track_title = _compact_sql_text(normalized_track_title)
+    compact_artist_name = _compact_sql_text(normalized_artist_name)
     token_filters = [
         or_(
-            normalized_track_title.like(f"%{escape_like(token)}%", escape="\\"),
-            normalized_artist_name.like(f"%{escape_like(token)}%", escape="\\"),
-            normalized_genre.like(f"%{escape_like(token)}%", escape="\\"),
-            normalized_tags.like(f"%{escape_like(token)}%", escape="\\"),
+            normalized_track_title.like(f"%{_escape_like(token)}%", escape="\\"),
+            normalized_artist_name.like(f"%{_escape_like(token)}%", escape="\\"),
+            normalized_genre.like(f"%{_escape_like(token)}%", escape="\\"),
         )
-        for token in normalized_query.split()
-        if len(token) > 1
+        for token in search_tokens(query)
     ]
     token_match = and_(*token_filters) if token_filters else False
-    exact_title_rank = case((normalized_track_title == normalized_title_query, 0), else_=1)
-    exact_artist_rank = case((normalized_artist_name == normalized_query, 0), else_=1)
+    compact_match = (
+        or_(
+            compact_track_title == compact_query,
+            compact_artist_name == compact_query,
+        )
+        if len(compact_query) >= 3
+        else False
+    )
+    exact_title_rank = case(
+        (
+            or_(
+                normalized_track_title == normalized_title_query,
+                compact_track_title == compact_query,
+            ),
+            0,
+        ),
+        else_=1,
+    )
+    exact_artist_rank = case(
+        (
+            or_(
+                normalized_artist_name == normalized_query,
+                compact_artist_name == compact_query,
+            ),
+            0,
+        ),
+        else_=1,
+    )
+    main_artist_role_rank = case((TrackArtist.role == "main", 0), else_=1)
     title_contains_rank = case((normalized_track_title.like(title_pattern, escape="\\"), 0), else_=1)
     artist_contains_rank = case((normalized_artist_name.like(pattern, escape="\\"), 0), else_=1)
+    usable_duration_rank = case((Track.duration_seconds >= 30, 0), (Track.duration_seconds > 0, 1), else_=2)
+    canonical_artist_rank = case((Artist.is_canonical == True, 0), else_=1)
+    suspicious_identity_rank = case(
+        (
+            and_(
+                normalized_track_title == normalized_title_query,
+                normalized_artist_name == normalized_query,
+                Track.duration_seconds <= 0,
+            ),
+            1,
+        ),
+        else_=0,
+    )
     stmt = (
         with_artists(select(Track))
         .join(TrackArtist)
@@ -211,21 +288,73 @@ def search_tracks(db: Session, query: str, limit: int = 50) -> list[Track]:
                 normalized_track_title.like(title_pattern, escape="\\"),
                 normalized_artist_name.like(pattern, escape="\\"),
                 normalized_genre.like(pattern, escape="\\"),
-                normalized_tags.like(pattern, escape="\\"),
+                compact_match,
                 token_match,
             )
         )
         .order_by(
             exact_title_rank,
+            suspicious_identity_rank,
             exact_artist_rank,
             title_contains_rank,
             artist_contains_rank,
+            usable_duration_rank,
+            main_artist_role_rank,
+            canonical_artist_rank,
+            Artist.source_verified.desc(),
+            Artist.source_followers_count.desc(),
             Track.popularity_score.desc(),
             Track.created_at.desc(),
         )
-        .limit(limit)
+        .limit(min(1500, safe_limit * 3))
     )
-    return list(db.execute(stmt).scalars().unique().all())
+    rows = list(db.execute(stmt).scalars().all())
+    return _unique_tracks(rows, safe_limit)
+
+
+def search_track_fuzzy_candidates(db: Session, query: str, limit: int = 100) -> list[Track]:
+    """Return a bounded pool for typo-aware Python reranking.
+
+    This deliberately uses portable LIKE fragments instead of SQLite-specific
+    FTS/trigram features so the same repository remains usable on PostgreSQL.
+    """
+
+    if not normalize_search_text(query):
+        return []
+    fragments = search_candidate_fragments(query)
+    if not fragments:
+        return []
+    safe_limit = max(1, min(int(limit), 500))
+    normalized_track_title = func.replace(Track.normalized_title, "ё", "е")
+    normalized_artist_name = func.replace(Artist.normalized_name, "ё", "е")
+    compact_track_title = _compact_sql_text(normalized_track_title)
+    compact_artist_name = _compact_sql_text(normalized_artist_name)
+    fragment_filters = [
+        or_(
+            compact_track_title.like(f"%{_escape_like(fragment)}%", escape="\\"),
+            compact_artist_name.like(f"%{_escape_like(fragment)}%", escape="\\"),
+        )
+        for fragment in fragments
+    ]
+    stmt = (
+        with_artists(select(Track))
+        .join(TrackArtist)
+        .join(Artist)
+        .where(or_(*fragment_filters))
+        .order_by(
+            case((TrackArtist.role == "main", 0), else_=1),
+            case((Track.is_playable == True, 0), else_=1),
+            case((Track.duration_seconds >= 30, 0), (Track.duration_seconds > 0, 1), else_=2),
+            case((Artist.is_canonical == True, 0), else_=1),
+            Artist.source_verified.desc(),
+            Artist.source_followers_count.desc(),
+            Track.popularity_score.desc(),
+            Track.created_at.desc(),
+        )
+        .limit(min(1500, safe_limit * 4))
+    )
+    rows = list(db.execute(stmt).scalars().all())
+    return _unique_tracks(rows, safe_limit)
 
 
 def list_recent_tracks(db: Session, limit: int = 12) -> list[Track]:

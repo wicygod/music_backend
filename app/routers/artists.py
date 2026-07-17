@@ -1,18 +1,21 @@
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
 from app.database import get_db
 from app.repositories.artists import get_artist, get_artist_track_count, get_artist_tracks, list_artists
+from app.repositories.albums import album_refresh_due, list_artist_albums
 from app.repositories.personalization import list_onboarding_artists
 from app.schemas.artist import ArtistListResponse, ArtistWithTracks
+from app.schemas.album import AlbumRead
 from app.schemas.personalization import OnboardingArtistRead, OnboardingArtistsResponse
 from app.schemas.track import TrackRead
 from app.services.admin_monitor import record_event
 from app.services.canonical_artist_service import refresh_canonical_artist_for_search
 from app.services.recommendation_config import RECOMMENDATION_CONFIG
-from app.services.serialization_service import artist_to_read, track_to_read
+from app.services.album_import_service import schedule_artist_album_hydration
+from app.services.serialization_service import album_to_read, artist_to_read, track_to_read
 
 
 router = APIRouter(prefix="/api/artists", tags=["artists"])
@@ -114,3 +117,22 @@ def read_artist_tracks(artist_id: int, db: Session = Depends(get_db)) -> list[Tr
     if not artist:
         raise HTTPException(status_code=404, detail="Artist not found")
     return [track_to_read(track) for track in get_artist_tracks(db, artist_id)]
+
+
+@router.get("/{artist_id}/albums", response_model=list[AlbumRead])
+def read_artist_albums(
+    artist_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+) -> list[AlbumRead]:
+    artist = get_artist(db, artist_id)
+    if not artist:
+        raise HTTPException(status_code=404, detail="Artist not found")
+    albums = list_artist_albums(db, artist_id)
+    if (
+        artist.is_canonical
+        and (artist.source_name or "").lower() in {"soundcloud", "sc"}
+        and album_refresh_due(db, artist_id)
+    ):
+        schedule_artist_album_hydration(artist_id, background_tasks)
+    return [album_to_read(album) for album in albums]

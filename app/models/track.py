@@ -35,6 +35,7 @@ class Track(Base):
     )
 
     artist_links = relationship("TrackArtist", back_populates="track", cascade="all, delete-orphan")
+    album_links = relationship("AlbumTrack", back_populates="track", cascade="all, delete-orphan")
 
 
 class TrackArtist(Base):

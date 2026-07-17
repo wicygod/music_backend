@@ -1,3 +1,4 @@
+from app.models.album import Album, AlbumTrack
 from app.models.artist import Artist
 from app.models.history import ListeningHistory
 from app.models.import_job import ImportJob, ImportJobReport
@@ -7,6 +8,8 @@ from app.models.track import SearchCache, Track, TrackArtist
 from app.models.user import BlockedUser, User
 
 __all__ = [
+    "Album",
+    "AlbumTrack",
     "Artist",
     "BlockedUser",
     "ImportJob",

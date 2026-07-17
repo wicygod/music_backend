@@ -147,7 +147,18 @@ def source_profile_matches_artist(source_url: str | None, artist: str | None) ->
         return False
     profile = _compact(path_parts[0])
     expected = _compact(artist)
-    return bool(profile and expected and (profile == expected or expected in profile or profile in expected))
+    if not profile or not expected:
+        return False
+    if profile == expected:
+        return True
+
+    # Very short SoundCloud names sometimes stretch a letter (for example
+    # ``wwwwxx`` for ``wx``). Restrict this alias rule to short artist names so
+    # typo/reupload handles cannot impersonate ordinary names.
+    if len(expected) > 3:
+        return False
+    collapse_repeats = lambda value: re.sub(r"(.)\1+", r"\1", value)
+    return collapse_repeats(profile) == collapse_repeats(expected)
 
 
 def has_clean_artist_signal(title: str | None, artist: str | None, source_url: str | None = None) -> bool:

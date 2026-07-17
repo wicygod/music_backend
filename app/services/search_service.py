@@ -1,3 +1,4 @@
+import hashlib
 import json
 import random
 import re
@@ -20,6 +21,7 @@ from app.repositories.tracks import (
     ensure_track_artist_link,
     find_duplicate_track_for_artist,
     find_track_by_provider_external_id,
+    search_track_fuzzy_candidates,
 )
 from app.schemas.track import TrackRead
 from app.schemas.track import TrackSeedCreate
@@ -28,15 +30,26 @@ from app.services.artist_cleanup_service import (
     artist_from_title,
     clean_provider_artist,
     provider_authority_score,
+    source_profile_matches_artist,
     title_without_artist_prefix,
 )
 from app.services.cover_service import extract_cover_url, fetch_soundcloud_oembed_cover
-from app.services.normalization_service import clean_display_artist_name, detect_artist_region, normalize_name, normalize_title
+from app.services.normalization_service import (
+    all_search_tokens_match,
+    clean_display_artist_name,
+    compact_search_text,
+    detect_artist_region,
+    normalize_name,
+    normalize_search_text,
+    normalize_title,
+    search_token_matches,
+    search_tokens,
+)
 from app.services.popular_ranking_service import PROVIDER_POPULARITY_TAG, provider_popularity_score
 from app.services.serialization_service import track_to_read
 from app.services.soundcloud_profile_service import fetch_soundcloud_profile
 from app.services.proxy_rotator import proxy_rotator
-from app.services.track_filter_service import dedupe_tracks, is_music_track
+from app.services.track_filter_service import is_music_track
 
 
 SEARCH_RESULT_LIMIT = 150
@@ -45,16 +58,19 @@ HYDRATION_COOLDOWN_SECONDS = 2 * 60
 VARIANT_QUOTA = 2
 DEDUP_SIMILARITY_THRESHOLD = 0.88
 DEDUP_CATEGORY_QUOTAS = {
-    "original": 2,
-    "speed": 2,
-    "slowed": 2,
-    "custom": 2,
+    "original": 1,
+    "speed": 1,
+    "slowed": 1,
+    "custom": 1,
 }
+MIN_MUSIC_DURATION_SECONDS = 10
 MAX_MUSIC_DURATION_SECONDS = 15 * 60
 COOKIES_FILE = Path("secrets/cookies.txt")
 _hydration_lock = threading.Lock()
 _hydrating_queries: set[str] = set()
+_scheduled_queries: set[str] = set()
 _hydrated_queries: dict[str, float] = {}
+_hydration_slots = threading.BoundedSemaphore(2)
 
 VARIANT_PATTERNS = {
     "slowed": re.compile(r"\bslowed\b|\bslow\s*\+\s*reverb\b|\bslowed\s*\+\s*reverb\b", re.IGNORECASE),
@@ -98,6 +114,10 @@ USER_AGENTS = (
 
 def _log(message: str) -> None:
     print(message, flush=True)
+
+
+def _query_log_key(query: str) -> str:
+    return hashlib.sha256(normalize_search_text(query).encode("utf-8")).hexdigest()[:12]
 
 
 def _yt_dlp_options(**overrides) -> dict:
@@ -165,9 +185,10 @@ def _is_youtube_music_source(source_url: str | None) -> bool:
 def _candidate_source_url(provider_name: str, entry: dict) -> str | None:
     source_url = entry.get("webpage_url") or entry.get("original_url") or entry.get("url")
     if provider_name == "youtube":
-        if source_url and not _youtube_video_id(str(source_url)):
+        external_id = str(entry.get("id") or "").strip()
+        if source_url and not _youtube_video_id(str(source_url)) and not external_id:
             return None
-        return _canonical_youtube_music_url(str(source_url or ""), str(entry.get("id") or ""))
+        return _canonical_youtube_music_url(str(source_url or ""), external_id)
     if provider_name == "soundcloud" and _is_soundcloud_source(source_url):
         return str(source_url)
     return None
@@ -178,8 +199,11 @@ def _is_allowed_provider_entry(provider_name: str, entry: dict) -> bool:
     if not source_url:
         return False
 
-    duration_seconds = int(entry.get("duration") or 0)
-    if duration_seconds and duration_seconds > MAX_MUSIC_DURATION_SECONDS:
+    duration_seconds = _safe_int(entry.get("duration"))
+    if (
+        duration_seconds < MIN_MUSIC_DURATION_SECONDS
+        or duration_seconds > MAX_MUSIC_DURATION_SECONDS
+    ):
         return False
 
     haystack = " ".join(
@@ -254,7 +278,7 @@ def _dedupe_category(text: str | None) -> str:
 
 
 def _clean_title_for_grouping(title: str | None) -> str:
-    cleaned = (title or "").lower()
+    cleaned = title_without_artist_prefix(title).lower()
     cleaned = DOMAIN_RE.sub(" ", cleaned)
     cleaned = FILE_EXT_RE.sub(" ", cleaned)
     cleaned = BRACKET_RE.sub(" ", cleaned)
@@ -313,10 +337,24 @@ def _empty_dedupe_counts() -> dict[str, int]:
 def _take_with_song_dedupe(groups: list[dict], item) -> bool:
     title = _title_from_item(item)
     base_title = _clean_title_for_grouping(title)
+    parsed_artist = artist_from_title(title)
+    artist_key = normalize_name(parsed_artist or _item_artist_text(item))
     category = _dedupe_category(title)
-    group = next((candidate for candidate in groups if _looks_like_same_song(base_title, candidate["base"])), None)
+    group = next(
+        (
+            candidate
+            for candidate in groups
+            if _looks_like_same_song(base_title, candidate["base"])
+            and (
+                not artist_key
+                or not candidate["artist"]
+                or artist_key == candidate["artist"]
+            )
+        ),
+        None,
+    )
     if not group:
-        group = {"base": base_title, "counts": _empty_dedupe_counts()}
+        group = {"base": base_title, "artist": artist_key, "counts": _empty_dedupe_counts()}
         groups.append(group)
     if group["counts"].get(category, 0) >= DEDUP_CATEGORY_QUOTAS[category]:
         return False
@@ -378,53 +416,46 @@ def _is_clean_catalog_track(track) -> bool:
         return False
     if BAD_VIDEO_TERMS_RE.search(" ".join(str(value or "") for value in (track.title, track.source_url))):
         return False
-    if not track.source_url:
+    if not bool(getattr(track, "is_playable", False)):
+        return False
+    if getattr(track, "audio_src", None):
         return True
-    if track.is_playable:
-        return _is_known_provider_source(track.source_name, track.source_url)
-    return not any(bad in str(track.source_url).lower() for bad in ("vk.com", "vkontakte", "dzen.ru", "rutube.ru"))
+    if not track.source_url or _safe_int(getattr(track, "duration_seconds", 0)) < MIN_MUSIC_DURATION_SECONDS:
+        return False
+    return _is_known_provider_source(track.source_name, track.source_url)
 
 
 def _catalog_track_matches_query(track, query: str) -> bool:
     tokens = _query_tokens(query)
-    if len(tokens) <= 1:
+    artists = _item_artist_text(track)
+    title_haystack = normalize_search_text(track.title)
+    artist_haystack = normalize_search_text(artists)
+    genre_haystack = normalize_search_text(str(getattr(track, "genre", "") or ""))
+    compact_query = compact_search_text(query)
+    if len(compact_query) >= 3 and compact_query in compact_search_text(f"{artists} {track.title}"):
         return True
-    artists = " ".join(
-        link.artist.name
-        for link in getattr(track, "artist_links", []) or []
-        if getattr(link, "artist", None) and link.artist.name
-    )
-    title_haystack = normalize_name(track.title)
-    artist_haystack = normalize_name(artists)
-    tags_haystack = normalize_name(str(getattr(track, "tags_json", "") or ""))
-    if normalize_name(query) in tags_haystack:
-        return True
+    if not tokens:
+        return False
     if _all_tokens_match(tokens, title_haystack):
         return True
     if _all_tokens_match(tokens, artist_haystack):
         return True
-    return _all_tokens_match(tokens, f"{artist_haystack} {title_haystack}")
-
-
-def _query_tokens(query: str) -> list[str]:
-    return [token for token in normalize_name(query).split() if len(token) > 1]
-
-
-def _token_matches_text(token: str, normalized_text: str) -> bool:
-    if token in normalized_text:
-        return True
-    if len(token) < 4:
-        return False
-    return any(
-        len(candidate) >= 4
-        and abs(len(token) - len(candidate)) <= 2
-        and SequenceMatcher(None, token, candidate).ratio() >= 0.84
-        for candidate in normalized_text.split()
+    return _all_tokens_match(
+        tokens,
+        f"{artist_haystack} {title_haystack} {genre_haystack}",
     )
 
 
+def _query_tokens(query: str) -> list[str]:
+    return search_tokens(query)
+
+
+def _token_matches_text(token: str, normalized_text: str) -> bool:
+    return search_token_matches(token, normalized_text)
+
+
 def _all_tokens_match(tokens: list[str], normalized_text: str) -> bool:
-    return bool(tokens) and all(_token_matches_text(token, normalized_text) for token in tokens)
+    return all_search_tokens_match(tokens, normalized_text)
 
 
 def _title_matches_query(title: str | None, query: str) -> bool:
@@ -442,11 +473,30 @@ def _item_artist_text(item) -> str:
     direct = getattr(item, "artist", None)
     if isinstance(direct, str):
         return direct
-    return " ".join(
-        link.artist.name
-        for link in getattr(item, "artist_links", []) or []
-        if getattr(link, "artist", None) and link.artist.name
-    )
+    links = list(getattr(item, "artist_links", []) or [])
+    main_links = [link for link in links if getattr(link, "role", "main") == "main"]
+    source_owner_links = [
+        link
+        for link in links
+        if getattr(link, "role", "main") == "uploader"
+        and getattr(link, "artist", None)
+        and source_profile_matches_artist(
+            getattr(item, "source_url", None),
+            getattr(link.artist, "name", None),
+        )
+    ]
+    relevant_links = [*main_links, *source_owner_links] or links
+    names: list[str] = []
+    seen: set[str] = set()
+    for link in relevant_links:
+        artist = getattr(link, "artist", None)
+        name = str(getattr(artist, "name", "") or "").strip()
+        normalized = normalize_name(name)
+        if not name or normalized in seen:
+            continue
+        seen.add(normalized)
+        names.append(name)
+    return " ".join(names)
 
 
 def _item_title_text(item) -> str:
@@ -469,22 +519,36 @@ def _relevance_score(query: str, title_raw: str, artist_raw: str) -> int:
     5 – all query tokens found across artist + title combined
     6 – no match
     """
-    norm_query = normalize_name(query)
+    norm_title_query = normalize_search_text(query)
+    norm_artist_query = normalize_name(query)
+    compact_query = compact_search_text(query)
     tokens = _query_tokens(query)
-    norm_title = normalize_name(title_raw)
+    norm_title = normalize_search_text(title_raw)
     norm_artist = normalize_name(artist_raw)
 
     # Tier 0: exact title match
-    if norm_title == norm_query:
+    if norm_title == norm_title_query or (
+        len(compact_query) >= 3
+        and compact_search_text(title_raw) == compact_query
+    ):
         return 0
 
     # Tier 1: exact title match after stripping "Artist - " prefix
-    stripped = normalize_name(title_without_artist_prefix(title_raw))
-    if stripped != norm_title and stripped == norm_query:
+    stripped = normalize_search_text(title_without_artist_prefix(title_raw))
+    if stripped != norm_title and (
+        stripped == norm_title_query
+        or (
+            len(compact_query) >= 3
+            and compact_search_text(stripped) == compact_query
+        )
+    ):
         return 1
 
     # Tier 2: exact artist match
-    if norm_artist == norm_query:
+    if norm_artist == norm_artist_query or (
+        len(compact_query) >= 3
+        and compact_search_text(artist_raw) == compact_query
+    ):
         return 2
 
     # Tier 3: all tokens match inside title
@@ -511,9 +575,182 @@ def _prefer_title_matches(items: list, query: str) -> list:
         for _index, item in sorted(
             enumerate(items),
             key=lambda pair: (
-                _relevance_score(query, _item_title_text(pair[1]), _item_artist_text(pair[1])),
+                _relevance_bucket(
+                    _relevance_score(query, _item_title_text(pair[1]), _item_artist_text(pair[1]))
+                ),
+                *_originality_sort_key(pair[1], query),
                 pair[0],
             ),
+        )
+    ]
+
+
+def _relevance_bucket(tier: int) -> int:
+    # Provider titles commonly include the artist prefix. Treat
+    # ``Artist - Song`` and ``Song`` as the same textual match so authority,
+    # completeness and popularity choose the original instead of a fake
+    # title-shaped uploader.
+    return 0 if tier <= 1 else tier
+
+
+def _originality_sort_key(item, query: str) -> tuple:
+    """Prefer an authoritative playable original inside the same relevance tier.
+
+    Search providers frequently return title-shaped uploader accounts and old
+    zero-duration placeholders. Exact text still wins first, but those records
+    must not outrank a complete track from the artist's canonical profile.
+    """
+
+    title = normalize_search_text(_item_title_text(item))
+    artist = normalize_name(_item_artist_text(item))
+    normalized_title_query = normalize_search_text(query)
+    normalized_artist_query = normalize_name(query)
+    variant_rank = 0 if _dedupe_category(_item_title_text(item)) == "original" else 1
+    if isinstance(item, dict):
+        duration = _safe_int(item.get("duration"))
+        source_url = str(item.get("webpage_url") or item.get("url") or "")
+        playable = bool(source_url)
+        quality = 100.0 if playable and duration >= 30 else 50.0 if playable else 0.0
+        popularity = _safe_float(
+            item.get("view_count")
+            or item.get("playback_count")
+            or item.get("like_count")
+        )
+        uploader_url = str(item.get("uploader_url") or item.get("channel_url") or "")
+        parsed_artist = artist_from_title(_item_title_text(item))
+        credited_artist = parsed_artist or _entry_artist_name(item, "")
+        source_owner_match = int(source_profile_matches_artist(uploader_url, credited_artist))
+        canonical = source_owner_match
+        verified = int(bool(item.get("uploader_verified") or item.get("channel_is_verified") or item.get("verified")))
+        followers = _safe_int(item.get("uploader_follower_count") or item.get("channel_follower_count"))
+        metadata_noise = 0
+        needs_review = 0
+    else:
+        duration = _safe_int(getattr(item, "duration_seconds", 0))
+        source_url = str(getattr(item, "source_url", "") or "")
+        playable = bool(getattr(item, "is_playable", False) and _is_known_provider_source(getattr(item, "source_name", None), source_url))
+        quality = _safe_float(getattr(item, "quality_score", 0.0))
+        popularity = _safe_float(getattr(item, "popularity_score", 0.0))
+        links = list(getattr(item, "artist_links", []) or [])
+        main_links = [link for link in links if getattr(link, "role", "main") == "main"]
+        primary_links = main_links or links
+        primary_artists = [
+            link.artist
+            for link in primary_links
+            if getattr(link, "artist", None) is not None
+        ]
+        canonical = int(any(bool(getattr(linked, "is_canonical", False)) for linked in primary_artists))
+        verified = int(any(bool(getattr(linked, "source_verified", False)) for linked in primary_artists))
+        followers = max((int(getattr(linked, "source_followers_count", 0) or 0) for linked in primary_artists), default=0)
+        source_owner_match = int(any(
+            source_profile_matches_artist(source_url, getattr(link.artist, "name", None))
+            for link in links
+            if getattr(link, "artist", None) is not None
+        ))
+        metadata_noise = max(0, sum(1 for link in links if getattr(link, "role", "main") == "uploader") - 1)
+        needs_review = int(bool(getattr(item, "needs_review", False)))
+    authoritative_identity = bool(canonical or verified or source_owner_match or followers > 0)
+    suspicious_identity = int(
+        bool(normalized_title_query)
+        and title == normalized_title_query
+        and artist == normalized_artist_query
+        and not authoritative_identity
+    )
+    duration_rank = 0 if duration >= 30 else 1 if duration > 0 else 2
+    source_rank = 0 if playable else 1
+    return (
+        suspicious_identity,
+        source_rank,
+        needs_review,
+        duration_rank,
+        variant_rank,
+        metadata_noise,
+        -canonical,
+        -verified,
+        -source_owner_match,
+        -followers,
+        -popularity,
+        -quality,
+    )
+
+
+def _safe_int(value: object) -> int:
+    try:
+        return int(float(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_float(value: object) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _replace_track_uploader_link(track, profile_artist) -> bool:
+    """Keep uploader metadata aligned with the source URL actually stored.
+
+    A provider reupload that merely deduplicates into an existing song must not
+    become another displayed artist of that song.  This helper is used only
+    when the track's source belongs to ``profile_artist``.
+    """
+
+    links = list(getattr(track, "artist_links", []) or [])
+    uploader_links = [link for link in links if getattr(link, "role", "main") == "uploader"]
+    main_artist_ids = {
+        getattr(link, "artist_id", None) or getattr(getattr(link, "artist", None), "id", None)
+        for link in links
+        if getattr(link, "role", "main") == "main"
+    }
+    profile_id = getattr(profile_artist, "id", None)
+    changed = False
+    for link in uploader_links:
+        link_artist_id = getattr(link, "artist_id", None) or getattr(getattr(link, "artist", None), "id", None)
+        if profile_id in main_artist_ids or link_artist_id != profile_id:
+            track.artist_links.remove(link)
+            changed = True
+    if profile_id not in main_artist_ids and not any(
+        (getattr(link, "artist_id", None) or getattr(getattr(link, "artist", None), "id", None)) == profile_id
+        and getattr(link, "role", "main") == "uploader"
+        for link in track.artist_links
+    ):
+        track.artist_links.append(TrackArtist(artist=profile_artist, role="uploader"))
+        changed = True
+    return changed
+
+
+def _suppress_title_identity_placeholders(items: list, query: str) -> list:
+    """Hide title-shaped placeholder accounts when a complete original exists.
+
+    A legitimate self-titled song is retained unless the candidate is both
+    unauthoritative and incomplete.  The rule therefore removes the common
+    zero-duration ``title == artist == query`` imports without hiding covers
+    or different recordings that happen to share a title.
+    """
+
+    if not items:
+        return items
+
+    def duration(item) -> int:
+        if isinstance(item, dict):
+            return _safe_int(item.get("duration"))
+        return _safe_int(getattr(item, "duration_seconds", 0))
+
+    has_complete_original = any(
+        _relevance_score(query, _item_title_text(item), _item_artist_text(item)) <= 1
+        and _originality_sort_key(item, query)[0] == 0
+        and duration(item) >= 30
+        for item in items
+    )
+    if not has_complete_original:
+        return items
+    return [
+        item
+        for item in items
+        if not (
+            _originality_sort_key(item, query)[0] > 0
+            and duration(item) < 30
         )
     ]
 
@@ -562,7 +799,7 @@ def _provider_query_relevance(query: str, entry: dict) -> int:
     tier = _relevance_score(query, title_raw, artist_raw)
     if tier < 6:
         # Invert so that callers (who sort descending) rank tier-0 highest.
-        return 7 - tier
+        return 7 - _relevance_bucket(tier)
     return 0
 
 
@@ -615,9 +852,9 @@ def _search_provider(query: str, provider: dict, limit: int) -> list[dict]:
 
 def _entry_artist_name(entry: dict, fallback: str) -> str:
     return str(
-        entry.get("uploader")
-        or entry.get("artist")
+        entry.get("artist")
         or entry.get("creator")
+        or entry.get("uploader")
         or entry.get("channel")
         or fallback
     ).strip()
@@ -625,16 +862,6 @@ def _entry_artist_name(entry: dict, fallback: str) -> str:
 
 def _entry_artist_url(entry: dict) -> str | None:
     return entry.get("uploader_url") or entry.get("channel_url") or entry.get("creator_url")
-
-
-def _query_tag(query: str) -> str | None:
-    normalized = normalize_name(query)
-    return normalized or None
-
-
-def _ensure_query_tag(track, query: str) -> bool:
-    tag = _query_tag(query)
-    return _ensure_track_tag(track, tag)
 
 
 def _ensure_track_tag(track, tag: str | None) -> bool:
@@ -661,7 +888,13 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
     artist_name = clean_provider_artist(raw_title, raw_artist_name, query)
     normalized_query = normalize_name(query)
     normalized_raw_artist = normalize_name(raw_artist_name)
-    if artist_name and len(_query_tokens(query)) > 1 and normalized_raw_artist.startswith(normalized_query):
+    parsed_artist = artist_from_title(raw_title)
+    if (
+        artist_name
+        and parsed_artist
+        and normalize_name(parsed_artist) == normalized_query
+        and normalized_raw_artist == normalized_query
+    ):
         artist_name = clean_display_artist_name(query)
     provider_name = str(provider["name"])
     provider_score, provider_score_reliable = provider_popularity_score(
@@ -708,15 +941,12 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
             changed = True
         if provider_score_reliable and _ensure_track_tag(existing, PROVIDER_POPULARITY_TAG):
             changed = True
-        if profile_artist is not None:
-            ensure_track_artist_link(
-                db,
-                track_id=existing.id,
-                artist_id=profile_artist.id,
-                role="uploader",
-            )
+        if (
+            profile_artist is not None
+            and source_profile_matches_artist(existing.source_url, profile_artist.name)
+            and _replace_track_uploader_link(existing, profile_artist)
+        ):
             changed = True
-        parsed_artist = artist_from_title(raw_title)
         current_artists = {
             normalize_name(link.artist.name)
             for link in existing.artist_links
@@ -742,7 +972,9 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
                 profile_resolved_at=datetime.utcnow() if parsed_matches_profile else None,
                 import_status="imported",
             )
-            existing.artist_links.clear()
+            for link in list(existing.artist_links):
+                if getattr(link, "role", "main") == "main":
+                    existing.artist_links.remove(link)
             existing.artist_links.append(TrackArtist(artist=repaired_artist, role="main"))
             changed = True
         if existing.title != title:
@@ -752,14 +984,12 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
         if cover_url and not existing.cover_url:
             existing.cover_url = cover_url
             changed = True
-        if _ensure_query_tag(existing, query):
-            changed = True
         if changed:
             db.add(existing)
             db.commit()
         return True
 
-    duration_seconds = int(result.get("duration") or 0)
+    duration_seconds = _safe_int(result.get("duration"))
     normalized_artist = normalize_name(artist_name)
     duplicate = find_duplicate_track_for_artist(
         db,
@@ -784,7 +1014,8 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
             duplicate.source_url = str(source_url)
             duplicate.cover_url = duplicate.cover_url or cover_url
             duplicate.genre = duplicate.genre or result.get("genre") or None
-            _ensure_query_tag(duplicate, query)
+            if profile_artist is not None:
+                _replace_track_uploader_link(duplicate, profile_artist)
             db.add(duplicate)
             db.commit()
         else:
@@ -796,19 +1027,9 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
             if cover_url and not duplicate.cover_url:
                 duplicate.cover_url = cover_url
                 changed = True
-            if _ensure_query_tag(duplicate, query):
-                changed = True
             if changed:
                 db.add(duplicate)
                 db.commit()
-        if profile_artist is not None:
-            ensure_track_artist_link(
-                db,
-                track_id=duplicate.id,
-                artist_id=profile_artist.id,
-                role="uploader",
-            )
-            db.commit()
         return True
 
     profile_matches_artist = bool(
@@ -840,7 +1061,6 @@ def _save_provider_entry(db: Session, query: str, provider: dict, result: dict) 
             "provider",
             str(provider["tag"]),
             *([PROVIDER_POPULARITY_TAG] if provider_score_reliable else []),
-            *([_query_tag(query)] if _query_tag(query) else []),
         ],
         region=detect_artist_region(artist_name),
         popularity_score=provider_score,
@@ -899,60 +1119,105 @@ def _save_external_tracks(db: Session, query: str, existing_results: list | None
         if remaining <= 0:
             return
         try:
-            _log(f"[SEARCH HYDRATE] provider={provider['name']} start query={query}")
+            _log(f"[SEARCH HYDRATE] provider={provider['name']} start key={_query_log_key(query)}")
             stored = _save_provider_tracks(db, query, provider, dedupe_groups, remaining)
         except Exception:
             db.rollback()
             stored = 0
         accepted_total += stored
-        _log(f"[SEARCH HYDRATE] provider={provider['name']} stored={stored} query={query}")
+        _log(
+            f"[SEARCH HYDRATE] provider={provider['name']} stored={stored} "
+            f"key={_query_log_key(query)}"
+        )
         if accepted_total >= EXTERNAL_PARSE_LIMIT:
             return
 
 
+def _catalog_candidates(db: Session, query: str, limit: int) -> list:
+    direct = search_tracks(db, query, limit=limit)
+    fuzzy = search_track_fuzzy_candidates(db, query, limit=limit) if len(direct) < limit else []
+    merged = []
+    seen_ids: set[int] = set()
+    for track in [*direct, *fuzzy]:
+        if track.id in seen_ids:
+            continue
+        seen_ids.add(track.id)
+        merged.append(track)
+    return merged
+
+
 def hydrate_search_catalog(query: str) -> None:
-    normalized_query = normalize_name(query)
+    normalized_query = normalize_search_text(query)
     if not normalized_query:
+        return
+    if not _hydration_slots.acquire(blocking=False):
+        with _hydration_lock:
+            _scheduled_queries.discard(normalized_query)
         return
     with _hydration_lock:
         if normalized_query in _hydrating_queries:
+            _hydration_slots.release()
             return
+        _scheduled_queries.add(normalized_query)
         _hydrating_queries.add(normalized_query)
 
     try:
         with SessionLocal() as db:
             candidates = [
                 track
-                for track in search_tracks(db, query, limit=SEARCH_RESULT_LIMIT * 2)
+                for track in _catalog_candidates(db, query, limit=SEARCH_RESULT_LIMIT * 2)
                 if _is_clean_catalog_track(track) and _catalog_track_matches_query(track, query)
             ]
-            candidates = _prefer_title_matches(candidates, query)
+            candidates = _suppress_title_identity_placeholders(
+                _prefer_title_matches(candidates, query),
+                query,
+            )
             local_results = _apply_variant_quota(
                 candidates
             )
-            _log(f"[SEARCH HYDRATE] start query={query} local={len(local_results)}")
+            _log(f"[SEARCH HYDRATE] start key={_query_log_key(query)} local={len(local_results)}")
             _save_external_tracks(db, query, existing_results=local_results)
     finally:
         with _hydration_lock:
             _hydrating_queries.discard(normalized_query)
+            _scheduled_queries.discard(normalized_query)
             _hydrated_queries[normalized_query] = time.monotonic()
+            if len(_hydrated_queries) > 2048:
+                oldest = sorted(_hydrated_queries, key=_hydrated_queries.get)[:512]
+                for cache_key in oldest:
+                    _hydrated_queries.pop(cache_key, None)
+        _hydration_slots.release()
 
 
 def _schedule_hydration(query: str, background_tasks: BackgroundTasks | None) -> None:
-    normalized_query = normalize_name(query)
+    normalized_query = normalize_search_text(query)
     if not normalized_query:
         return
     with _hydration_lock:
-        if normalized_query in _hydrating_queries:
+        if normalized_query in _hydrating_queries or normalized_query in _scheduled_queries:
             return
         hydrated_at = _hydrated_queries.get(normalized_query)
         if hydrated_at and time.monotonic() - hydrated_at < HYDRATION_COOLDOWN_SECONDS:
             return
-    if background_tasks:
-        background_tasks.add_task(hydrate_search_catalog, query)
-    else:
-        thread = threading.Thread(target=hydrate_search_catalog, args=(query,), daemon=True)
-        thread.start()
+        _scheduled_queries.add(normalized_query)
+    try:
+        if background_tasks:
+            background_tasks.add_task(hydrate_search_catalog, query)
+        else:
+            thread = threading.Thread(target=hydrate_search_catalog, args=(query,), daemon=True)
+            thread.start()
+    except Exception:
+        with _hydration_lock:
+            _scheduled_queries.discard(normalized_query)
+        raise
+
+
+def search_hydration_pending(query: str) -> bool:
+    normalized_query = normalize_search_text(query)
+    if not normalized_query:
+        return False
+    with _hydration_lock:
+        return normalized_query in _scheduled_queries or normalized_query in _hydrating_queries
 
 
 def search_local_catalog(
@@ -962,18 +1227,22 @@ def search_local_catalog(
     limit: int = SEARCH_RESULT_LIMIT,
 ) -> list[TrackRead]:
     safe_limit = max(1, min(limit, SEARCH_RESULT_LIMIT))
+    if not normalize_search_text(query):
+        return []
     candidate_limit = min(SEARCH_RESULT_LIMIT * 2, max(safe_limit * 2, safe_limit + 20))
     candidates = [
         track
-        for track in search_tracks(db, query, limit=candidate_limit)
+        for track in _catalog_candidates(db, query, limit=candidate_limit)
         if _is_clean_catalog_track(track) and _catalog_track_matches_query(track, query)
     ]
-    candidates = _prefer_title_matches(candidates, query)
+    candidates = _suppress_title_identity_placeholders(
+        _prefer_title_matches(candidates, query),
+        query,
+    )
     local_results = _apply_variant_quota(
         candidates,
         limit=safe_limit,
     )
-    local_results = dedupe_tracks(local_results, limit=safe_limit)
     changed = False
     for track in local_results:
         if _canonicalize_catalog_track_source(track):

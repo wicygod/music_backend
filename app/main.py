@@ -8,6 +8,7 @@ from app.middleware.performance import PerformanceMetricsMiddleware
 from app.middleware.security import LightweightSecurityMiddleware
 from app.routers import (
     admin,
+    albums,
     artists,
     auth,
     bugreport,
@@ -48,6 +49,7 @@ app.add_middleware(LightweightSecurityMiddleware)
 app.add_middleware(PerformanceMetricsMiddleware)
 
 app.include_router(admin.router)
+app.include_router(albums.router)
 app.include_router(auth.router)
 app.include_router(bugreport.router)
 app.include_router(feed.router)

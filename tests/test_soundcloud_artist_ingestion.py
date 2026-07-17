@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.database import Base
 from app.models.artist import Artist
-from app.models.track import TrackArtist
+from app.models.track import Track, TrackArtist
 from app.services import search_service
 from app.services.normalization_service import normalize_artist_name
 from app.services.soundcloud_profile_service import SoundCloudProfile
@@ -126,4 +126,51 @@ def test_exact_uploader_enriches_existing_seed_artist(monkeypatch) -> None:
         assert seed.source_external_id == "soundcloud:users:1043731018"
         assert seed.avatar_url == "https://i1.sndcdn.com/avatars-4ngelkai-t500x500.jpg"
         assert seed.source_followers_count == 1234
+    engine.dispose()
+
+
+def test_deduplicated_reupload_is_not_attached_as_an_artist(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    profiles = {
+        "https://soundcloud.com/kaiangel": _profile("Kai Angel", "kaiangel", "1"),
+        "https://soundcloud.com/reupload": _profile("Random Reupload", "reupload", "2"),
+    }
+    monkeypatch.setattr(
+        search_service,
+        "fetch_soundcloud_profile",
+        lambda url, **_kwargs: profiles.get(url),
+    )
+
+    with Session(engine) as db:
+        assert search_service._save_provider_entry(
+            db,
+            "Test song",
+            PROVIDER,
+            _result(
+                title="Kai Angel - Test song",
+                uploader="Kai Angel",
+                slug="kaiangel",
+                profile_id="1",
+            ),
+        )
+        assert search_service._save_provider_entry(
+            db,
+            "Test song",
+            PROVIDER,
+            _result(
+                title="Kai Angel - Test song",
+                uploader="Random Reupload",
+                slug="reupload",
+                profile_id="2",
+            ),
+        )
+
+        track = db.execute(select(Track)).scalars().one()
+        linked_names = {
+            link.artist.name
+            for link in track.artist_links
+        }
+
+    assert linked_names == {"Kai Angel"}
     engine.dispose()

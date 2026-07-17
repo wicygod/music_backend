@@ -14,6 +14,7 @@ from app.models.track import Track, TrackArtist
 from app.services.normalization_service import normalize_name, normalize_title
 from app.services import search_service
 from app.services.search_service import (
+    _item_artist_text,
     _is_allowed_provider_entry,
     _prefer_title_matches,
     _provider_query_relevance,
@@ -172,6 +173,145 @@ def test_stable_order_same_tier() -> None:
     ranked = _prefer_title_matches([first, second], "Trinity")
 
     assert ranked == [first, second]
+
+
+def test_complete_canonical_track_beats_zero_duration_title_uploader() -> None:
+    fake = SimpleNamespace(
+        title="Миллионер из трущоб",
+        duration_seconds=0,
+        quality_score=100,
+        popularity_score=1000,
+        is_playable=True,
+        source_name="soundcloud",
+        source_url="https://soundcloud.com/fake/millioner",
+        artist_links=[
+            SimpleNamespace(
+                artist=SimpleNamespace(
+                    name="Миллионер из трущоб",
+                    is_canonical=False,
+                    source_followers_count=0,
+                )
+            )
+        ],
+    )
+    original = SimpleNamespace(
+        title="Миллионер из трущоб",
+        duration_seconds=86,
+        quality_score=100,
+        popularity_score=20,
+        is_playable=True,
+        source_name="soundcloud",
+        source_url="https://soundcloud.com/tuborosho/millioner-iz-truschob",
+        artist_links=[
+            SimpleNamespace(
+                artist=SimpleNamespace(
+                    name="Tuborosho",
+                    is_canonical=True,
+                    source_followers_count=25_000,
+                )
+            )
+        ],
+    )
+
+    ranked = _prefer_title_matches([fake, original], "Миллионер из трущоб")
+
+    assert ranked[0] is original
+
+
+def test_uploader_credit_does_not_turn_a_reupload_into_an_artist_match() -> None:
+    reupload = SimpleNamespace(
+        title="Other artist song",
+        source_url="https://soundcloud.com/trinity-reuploads/other-artist-song",
+        artist_links=[
+            SimpleNamespace(role="main", artist=SimpleNamespace(name="Other Artist")),
+            SimpleNamespace(role="uploader", artist=SimpleNamespace(name="Trinity")),
+        ],
+    )
+    real_artist_track = SimpleNamespace(
+        title="Night Drive",
+        source_url="https://soundcloud.com/trinity/night-drive",
+        artist_links=[SimpleNamespace(role="main", artist=SimpleNamespace(name="Trinity"))],
+    )
+
+    assert _item_artist_text(reupload) == "Other Artist"
+    assert _prefer_title_matches([reupload, real_artist_track], "Trinity")[0] is real_artist_track
+
+
+def test_catalog_search_returns_the_authoritative_original_and_hides_placeholder(monkeypatch) -> None:
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    monkeypatch.setattr(search_service, "_schedule_hydration", lambda *_args, **_kwargs: None)
+
+    with Session(engine) as db:
+        fake_artist = Artist(
+            name="Миллионер из трущоб",
+            normalized_name=normalize_name("Миллионер из трущоб"),
+            genres_json="[]",
+            is_canonical=False,
+        )
+        tuborosho = Artist(
+            name="Tuborosho",
+            normalized_name=normalize_name("Tuborosho"),
+            genres_json="[]",
+            source_name="soundcloud",
+            source_url="https://soundcloud.com/tuborosho",
+            source_followers_count=59_922,
+            is_canonical=True,
+        )
+        wx = Artist(
+            name="wx",
+            normalized_name=normalize_name("wx"),
+            genres_json="[]",
+            source_name="soundcloud",
+            source_url="https://soundcloud.com/wwwwxx",
+            source_followers_count=1_105,
+            is_canonical=True,
+        )
+        db.add_all([fake_artist, tuborosho, wx])
+        db.flush()
+
+        placeholder = Track(
+            title="Миллионер из трущоб",
+            normalized_title=normalize_title("Миллионер из трущоб"),
+            duration_seconds=0,
+            tags_json="[]",
+            region="ru",
+            popularity_score=65,
+            quality_score=100,
+            is_playable=True,
+            source_name="youtube",
+            source_external_id="placeholder",
+            source_url="https://music.youtube.com/watch?v=placeholder",
+            needs_review=False,
+        )
+        original = Track(
+            title="Миллионер из трущоб",
+            normalized_title=normalize_title("Миллионер из трущоб"),
+            duration_seconds=86,
+            tags_json="[]",
+            region="ru",
+            popularity_score=70.495,
+            quality_score=100,
+            is_playable=True,
+            source_name="soundcloud",
+            source_external_id="original-wx",
+            source_url="https://soundcloud.com/wwwwxx/tmfts",
+            needs_review=False,
+        )
+        db.add_all([placeholder, original])
+        db.flush()
+        db.add_all([
+            TrackArtist(track_id=placeholder.id, artist_id=fake_artist.id, role="main"),
+            TrackArtist(track_id=original.id, artist_id=tuborosho.id, role="main"),
+            TrackArtist(track_id=original.id, artist_id=wx.id, role="uploader"),
+        ])
+        db.commit()
+
+        results = search_service.search_local_catalog(db, "Миллионер из трущоб", limit=10)
+
+    assert [item.source_external_id for item in results] == ["original-wx"]
+    assert [artist.name for artist in results[0].artists] == ["Tuborosho", "wx"]
+    engine.dispose()
 
 
 # ---------------------------------------------------------------------------

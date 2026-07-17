@@ -3,14 +3,16 @@ from typing import Any
 from urllib.parse import quote
 
 from app.models.artist import Artist
+from app.models.album import Album
 from app.models.import_job import ImportJob
 from app.models.playlist import UserFavorite, UserPlaylist
 from app.models.track import Track
 from app.schemas.artist import ArtistRead, ArtistSummary, ArtistWithTracks
+from app.schemas.album import AlbumRead, AlbumSummary
 from app.schemas.import_job import ImportJobRead
 from app.schemas.playlist import FavoriteRead, PlaylistRead
 from app.schemas.track import TrackRead
-from app.services.artist_cleanup_service import artist_from_title
+from app.services.artist_cleanup_service import artist_from_title, source_profile_matches_artist
 from app.services.cover_service import cover_url_for_client
 from app.services.normalization_service import normalize_name
 
@@ -88,14 +90,40 @@ def artist_to_read(artist: Artist, track_count: int | None = None) -> ArtistRead
 
 
 def track_to_read(track: Track) -> TrackRead:
-    main_first = sorted(track.artist_links, key=lambda link: 0 if link.role == "main" else 1)
-    artists = [artist_summary(link.artist) for link in main_first]
+    links = list(track.artist_links)
+    main_links = [link for link in links if link.role == "main"]
+    source_owner_links = [
+        link
+        for link in links
+        if link.role == "uploader"
+        and source_profile_matches_artist(track.source_url, link.artist.name)
+    ]
+    display_links = [*main_links, *source_owner_links] or sorted(
+        links,
+        key=lambda link: 0 if link.role == "main" else 1,
+    )
     parsed_artist = _popular_artist_from_title(track.title) or artist_from_title(track.title)
-    if parsed_artist and artists and normalize_name(artists[0].name) != normalize_name(parsed_artist):
-        artists[0] = artists[0].model_copy(update={"name": parsed_artist})
+    if parsed_artist:
+        parsed_key = normalize_name(parsed_artist)
+        display_links = sorted(
+            display_links,
+            key=lambda link: 0 if normalize_name(link.artist.name) == parsed_key else 1,
+        )
+    artists = []
+    seen_artist_ids: set[int] = set()
+    for link in display_links:
+        if link.artist.id in seen_artist_ids:
+            continue
+        seen_artist_ids.add(link.artist.id)
+        artists.append(artist_summary(link.artist))
     cover_url = cover_url_for_client(track.cover_url) or fallback_cover_data_url(
         track.title,
         parsed_artist or (artists[0].name if artists else ""),
+    )
+    album_link = min(
+        getattr(track, "album_links", []) or [],
+        key=lambda link: (link.disc_number, link.track_number, link.album_id),
+        default=None,
     )
     return TrackRead(
         id=track.id,
@@ -116,8 +144,51 @@ def track_to_read(track: Track) -> TrackRead:
         source_url=track.source_url,
         needs_review=track.needs_review,
         artists=artists,
+        album_id=album_link.album_id if album_link else None,
+        album_name=album_link.album.title if album_link else None,
+        album_track_number=album_link.track_number if album_link else None,
         created_at=track.created_at,
         updated_at=track.updated_at,
+    )
+
+
+def album_to_read(album: Album, matched_track_id: int | None = None) -> AlbumRead:
+    ordered_links = sorted(
+        (
+            link
+            for link in album.track_links
+            if link.track.is_playable
+            and not link.track.needs_review
+            and (
+                link.track.audio_src
+                or (
+                    link.track.source_url
+                    and (link.track.source_name or "").lower()
+                    in {"soundcloud", "sc", "youtube", "youtube_music", "yt"}
+                )
+            )
+        ),
+        key=lambda link: (
+            0 if matched_track_id is not None and link.track_id == matched_track_id else 1,
+            link.disc_number,
+            link.track_number,
+            link.track_id,
+        ),
+    )
+    return AlbumRead(
+        id=album.id,
+        title=album.title,
+        album_type=album.album_type,
+        cover_url=cover_url_for_client(album.cover_url),
+        release_date=album.release_date,
+        track_count=len(ordered_links),
+        artist=artist_summary(album.artist),
+        source_name=album.source_name,
+        source_url=album.source_url,
+        popularity_score=album.popularity_score,
+        is_available=album.is_available,
+        matched_track_id=matched_track_id,
+        tracks=[track_to_read(link.track) for link in ordered_links],
     )
 
 

@@ -27,6 +27,9 @@ class TrackRead(TrackBase):
     id: int
     normalized_title: str
     artists: list[ArtistSummary] = Field(default_factory=list)
+    album_id: int | None = None
+    album_name: str | None = None
+    album_track_number: int | None = None
     created_at: datetime
     updated_at: datetime
 

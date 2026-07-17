@@ -14,6 +14,13 @@ def get_artist(db: Session, artist_id: int) -> Artist | None:
     return db.get(Artist, artist_id)
 
 
+def get_artists_by_ids(db: Session, artist_ids: list[int]) -> list[Artist]:
+    unique_ids = list(dict.fromkeys(int(artist_id) for artist_id in artist_ids if artist_id))
+    if not unique_ids:
+        return []
+    return list(db.execute(select(Artist).where(Artist.id.in_(unique_ids))).scalars().all())
+
+
 def list_artists(
     db: Session,
     *,

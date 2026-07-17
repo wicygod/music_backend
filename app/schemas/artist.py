@@ -28,6 +28,10 @@ class ArtistSummary(BaseModel):
     name: str
     avatar_url: str | None = None
     region: str = "unknown"
+    is_canonical: bool = False
+    source_verified: bool = False
+    source_followers_count: int = 0
+    needs_review: bool = False
 
 
 class ArtistRead(ArtistBase):
